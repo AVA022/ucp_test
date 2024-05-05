@@ -194,7 +194,7 @@ static int init_listener(ucp_worker_h worker, uint16_t port, ucp_listener_h *lis
 	/* Create UCP listener to accept incoming connections */
 	status = ucp_listener_create(worker, &listener_params, listener_p);
 	if (status != UCS_OK) {
-		log_error("Failed to create UCP listener: %s", ucs_status_string(status));
+		//log_error("Failed to create UCP listener: %s", ucs_status_string(status));
 		return -1;
 	}
     return 0;
@@ -214,7 +214,7 @@ int main(){
         goto err;
     }
 
-    log_trace("1");
+    //log_trace("1");
     ret = init_listener(worker, 13337, &listener);
     if(ret != 0){
         goto err;
@@ -224,12 +224,12 @@ int main(){
 
 
     ucp_listener_destroy(listener);
-    log_trace("2");
+    //log_trace("2");
     ucp_worker_destroy(worker);
-    log_trace("3");
+    //log_trace("3");
     ucp_cleanup(context);
     
 err:
-    log_trace("Exiting with status %d", ret);
+    //log_trace("Exiting with status %d", ret);
     return ret;    
 }

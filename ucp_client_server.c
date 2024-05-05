@@ -37,6 +37,8 @@
 #include <unistd.h>    /* getopt */
 #include <stdlib.h>    /* atoi */
 
+#include <log.h>
+
 #define DEFAULT_PORT           13337
 #define IP_STRING_LEN          50
 #define PORT_STRING_LEN        8
@@ -274,9 +276,11 @@ static ucs_status_t start_client(ucp_worker_h ucp_worker,
     ep_params.sockaddr.addrlen = sizeof(connect_addr);
 
     status = ucp_ep_create(ucp_worker, &ep_params, client_ep);
+    log_trace("ucp_ep_create status: %s\n", ucs_status_string(status));
     if (status != UCS_OK) {
         fprintf(stderr, "failed to connect to %s (%s)\n", address_str,
                 ucs_status_string(status));
+        log_trace("ucp_ep_create status: %s\n", ucs_status_string(status));
     }
 
     return status;
@@ -828,11 +832,18 @@ static ucs_status_t server_create_ep(ucp_worker_h data_worker,
     ep_params.err_handler.arg = NULL;
 
     status = ucp_ep_create(data_worker, &ep_params, server_ep);
+    log_trace("ucp_ep_create status: %s\n", ucs_status_string(status));
     if (status != UCS_OK) {
         fprintf(stderr, "failed to create an endpoint on the server: (%s)\n",
                 ucs_status_string(status));
+        log_error("failed to create an endpoint on the server: (%s)\n",
+                ucs_status_string(status));
     }
-
+    // while (ucp_ep_create(data_worker, &ep_params, server_ep) != UCS_OK)
+    // {
+        
+    // }
+    
     return status;
 }
 
