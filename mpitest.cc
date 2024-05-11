@@ -5,6 +5,7 @@
 #include <log.h>
 #include <limits.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <sys/time.h>
 
 struct ucx_context {
@@ -20,6 +21,12 @@ static int * vector_buffer;
 static int ** chunk_ptrs;
 static const int VECTOR_SIZE = 64;
 static const int NUM_CHUNK = 2;
+
+static ucp_address_t*** g_all_workeraddress;
+static ucp_worker_h *g_workers;
+
+sem_t sem1;
+sem_t sem2;
 
 static bool init_chunk_ptrs()
 {
@@ -174,7 +181,7 @@ static ucs_status_t ucx_wait(ucp_worker_h ucp_worker, struct ucx_context *reques
 
         while (ucp_request_check_status(request) == UCS_INPROGRESS)
         {
-            printf("1\n");
+            //printf("1\n");
             ucp_worker_progress(ucp_worker);
         }
 
@@ -182,6 +189,7 @@ static ucs_status_t ucx_wait(ucp_worker_h ucp_worker, struct ucx_context *reques
         long seconds = end.tv_sec - start.tv_sec;
         long microseconds = end.tv_usec - start.tv_usec;
         double elapsed = seconds + microseconds*1e-6;
+        log_trace("elapsed time: %f\n", elapsed);
         
         request->completed = 0;
         status             = ucp_request_check_status(request);
@@ -194,7 +202,8 @@ static ucs_status_t ucx_wait(ucp_worker_h ucp_worker, struct ucx_context *reques
         fprintf(stderr, "unable to %s %s (%s)\n", op_str, data_str,
                 ucs_status_string(status));
     } else {
-        printf("finish to %s %s\n", op_str, data_str);
+        log_trace("in ucx_wait status : %s", ucs_status_string(status));
+        log_trace("finish to %s %s\n", op_str, data_str);
     }
 
     return status;
@@ -344,6 +353,24 @@ static bool recieve_reduce_copy_send(ucp_worker_h ucp_worker, ucp_ep_h ep, int s
 
 }
 
+static int recieve_reduce_copy(ucp_worker_h ucp_worker, int src_chunk_id, ucp_tag_t dst_chunk_id)
+{
+    int *scratch_chunk = (int *)malloc((VECTOR_SIZE / NUM_CHUNK) * sizeof(int));
+
+    if(receive_block(ucp_worker, dst_chunk_id, tag_mask, scratch_chunk) != 0){
+        log_error("Failed to receive chunk from %d", src_chunk_id);
+        return -1;
+    }
+
+    local_reduce(scratch_chunk, chunk_ptrs[dst_chunk_id], (VECTOR_SIZE / NUM_CHUNK));
+
+    //假装copy了，感觉在cpu中没什么区别
+    free(scratch_chunk);
+
+    return 0;
+
+}
+
 static int init_endpoint(ucp_worker_h ucp_worker, ucp_address_t *peer_addr, ucp_ep_h *ep)
 {
     ucp_ep_params_t ep_params;
@@ -367,7 +394,201 @@ static int init_endpoint(ucp_worker_h ucp_worker, ucp_address_t *peer_addr, ucp_
     return 0;
 }
 
+
+bool allgather_addresses_len(int * local_worker_addr_len, int * all_worker_addr_len, int worker_size){
+    MPI_Allgather(local_worker_addr_len, worker_size, MPI_INT, all_worker_addr_len, worker_size, MPI_INT, MPI_COMM_WORLD);
+    return true;
+}
+
+static void allgather_addresses(ucp_worker_h *workers, int num_workers_per_process, int world_size, int world_rank){
+    ucp_address_t **local_addrs = (ucp_address_t **)malloc(num_workers_per_process * sizeof(ucp_address_t*));
+    size_t *local_addr_lengths = (size_t*)malloc(num_workers_per_process * sizeof(size_t));
+
+    // Assuming UCP workers have been initialized
+    for (int i = 0; i < num_workers_per_process; i++) {
+        ucp_worker_get_address(workers[i], &local_addrs[i], &local_addr_lengths[i]);
+    }
+
+    // Collect all worker address lengths
+    size_t *all_address_lengths = (size_t*)malloc(world_size * num_workers_per_process * sizeof(size_t));
+    MPI_Allgather(local_addr_lengths, num_workers_per_process, MPI_UNSIGNED_LONG,
+                  all_address_lengths, num_workers_per_process, MPI_UNSIGNED_LONG, MPI_COMM_WORLD);
+
+    // Calculate send buffer size and displacements
+    int *send_displs = (int *)malloc(num_workers_per_process * sizeof(int));
+    send_displs[0] = 0;
+    for (int i = 1; i < num_workers_per_process; i++) {
+        send_displs[i] = send_displs[i - 1] + local_addr_lengths[i - 1];
+    }
+
+    int send_buffer_size = send_displs[num_workers_per_process - 1] + local_addr_lengths[num_workers_per_process - 1];
+    char *send_buffer = (char *)malloc(send_buffer_size);
+    for (int i = 0; i < num_workers_per_process; i++) {
+        memcpy(send_buffer + send_displs[i], local_addrs[i], local_addr_lengths[i]);
+    }
+
+    int *recvcounts = (int *)malloc(world_size * sizeof(int));
+    int *displs = (int *)malloc(world_size * sizeof(int));
+    displs[0] = 0;
+    for (int i = 0; i < world_size; i++) {
+        recvcounts[i] = 0;
+        for (int j = 0; j < num_workers_per_process; j++) {
+            recvcounts[i] += all_address_lengths[i * num_workers_per_process + j];
+        }
+        if (i > 0) {
+            displs[i] = displs[i - 1] + recvcounts[i - 1];
+        }
+    }
+
+    char *recv_buffer = (char *)malloc(displs[world_size - 1] + recvcounts[world_size - 1]);
+    MPI_Allgatherv(send_buffer, send_buffer_size, MPI_BYTE,
+                   recv_buffer, recvcounts, displs, MPI_BYTE, MPI_COMM_WORLD);
+
+    // Build a 2D array for accessing addresses
+    ucp_address_t ***worker_addresses = (ucp_address_t ***)malloc(world_size * sizeof(ucp_address_t**));
+    for (int i = 0; i < world_size; i++) {
+        worker_addresses[i] = (ucp_address_t **)malloc(num_workers_per_process * sizeof(ucp_address_t*));
+        int offset = 0;
+        for (int j = 0; j < num_workers_per_process; j++) {
+            worker_addresses[i][j] = (ucp_address_t*)(recv_buffer + displs[i] + offset);
+            offset += all_address_lengths[i * num_workers_per_process + j];
+        }
+    }
+    g_all_workeraddress = worker_addresses;
+
+    // Example usage
+    if (world_rank == 0) {
+        printf("Address of first worker of first process: %p\n", (void*)worker_addresses[0][0]);
+    }
+
+    //free resouces that malloc in this function
+    free(displs);
+    free(recvcounts);
+    free(send_buffer);
+    free(send_displs);
+    free(all_address_lengths);
+    free(local_addr_lengths);
+    free(local_addrs);
+}
+
+static int init_all_workers_ucp(ucp_worker_h *workers, ucp_context_h ucp_context, int num_workers_per_process){
+    for (int i = 0; i < num_workers_per_process; i++) {
+        if(init_worker(ucp_context, &workers[i]) != 0){
+            log_error("init the %d worker failed!\n", i);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int rank0_comunication(){
+    ucp_ep_h ep;
+    if(init_endpoint(g_workers[0], g_all_workeraddress[1][0], &ep) != 0){
+        log_error("init_endpoint failed!\n");
+        return -1;
+    }
+
+    chunk_ptrs[0][0] = 100;
+    if(chunk_send(g_workers[0], ep, 0, 0) != true){
+        log_error("chunk_send failed!\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int rank1_comunication(){
+    if(chunk_recieve(g_workers[0], 0) != true){
+        log_error("chunk_recieve failed!\n");
+        return -1;
+    }
+
+    log_debug("chunk_ptrs[0][0]: %d\n", chunk_ptrs[0][0]);
+    return 0;
+}
+
+void *rank0_thread0_communucation(void *arg){
+    
+    if(recieve_reduce_copy(g_workers[0],1,1)!=0){
+        log_error("recieve_reduce_copy failed!\n");
+    };
+    sem_post(&sem1);
+
+    sem_wait(&sem2);
+    if(chunk_recieve(g_workers[0], 0) != true){
+        log_error("chunk_recieve failed!\n");
+    }
+
+    return NULL;
+}
+
+void *rank0_thread1_communucation(void *arg){
+    ucp_ep_h ep;
+    if(init_endpoint(g_workers[1], g_all_workeraddress[1][0], &ep) != 0){
+        log_error("init_endpoint failed!\n");
+    }
+
+    log_trace("rank0_thread1_communucation: send chunk0 start\n");
+    if(chunk_send(g_workers[1], ep, 0, 0) != true){
+        log_error("chunk_send failed!\n");
+    }
+    sem_post(&sem2);
+
+    sem_wait(&sem1);
+    if(chunk_send(g_workers[1], ep, 1, 1) != true){
+        log_error("chunk_send failed!\n");
+    }
+
+    return NULL;
+}
+
+void *rank1_thread0_communucation(void *arg){
+    if(recieve_reduce_copy(g_workers[0],0,0)!=0){
+        log_error("recieve_reduce_copy failed!\n");
+    };
+    sem_post(&sem1);
+
+    sem_wait(&sem2);
+    if(chunk_recieve(g_workers[0], 1) != true){
+        log_error("chunk_recieve failed!\n");
+    }
+
+    return NULL;
+}
+
+void *rank1_thread1_communucation(void *arg){
+    ucp_ep_h ep;
+    if(init_endpoint(g_workers[1], g_all_workeraddress[0][0], &ep) != 0){
+        log_error("init_endpoint failed!\n");
+    }
+
+    log_trace("rank0_thread1_communucation: send chunk0 start\n");
+    if(chunk_send(g_workers[1], ep, 1, 1) != true){
+        log_error("chunk_send failed!\n");
+    }
+    sem_post(&sem2);
+
+    sem_wait(&sem1);
+    if(chunk_send(g_workers[1], ep, 0, 0) != true){
+        log_error("chunk_send failed!\n");
+    }
+
+    return NULL;
+}
+
+
+
+
+
+
+
 int main(int argc, char **argv) {
+    //alocate g_workers
+    g_workers = (ucp_worker_h *)malloc(2 * sizeof(ucp_worker_h));
+
+    sem_init(&sem1, 0, 0);
+    sem_init(&sem2, 0, 0);
+
     MPI_Init(&argc, &argv);
 
     //printf("Hello, world!\n");
@@ -378,7 +599,6 @@ int main(int argc, char **argv) {
 
     // 初始化UCP
     ucp_context_h ucp_context;
-    ucp_worker_h ucp_worker;
 
     if(init_context(&ucp_context) != 0){
         log_error("init_context failed!\n");
@@ -386,66 +606,71 @@ int main(int argc, char **argv) {
     }
 
     //init_worker
-    if(init_worker(ucp_context, &ucp_worker) != 0){
-        log_error("init_worker failed!\n");
+    if(init_all_workers_ucp(g_workers, ucp_context, 2) != 0){
+        log_error("init_all_workers_ucp failed!\n");
         return -1;
     }
 
-    // 获取本地UCX worker地址
-    ucp_address_t *local_addr;
-    size_t local_addr_length;
-    ucp_worker_get_address(ucp_worker, &local_addr, &local_addr_length);
-
-    // 分配空间以存储所有worker的地址长度和位移
-    size_t *all_address_lengths = (size_t *)malloc(world_size * sizeof(size_t));
-    int *displs = (int *)malloc(world_size * sizeof(int));  // 位移数组
-    int *recvcounts = (int *)malloc(world_size * sizeof(int));
-
-    // 通过MPI收集所有进程的地址长度
-    MPI_Allgather(&local_addr_length, 1, MPI_UNSIGNED_LONG, all_address_lengths, 1, MPI_UNSIGNED_LONG, MPI_COMM_WORLD);
-    if(world_rank == 0)
-        for(int i = 0; i < world_size; i++) {
-            printf("%ld\n", all_address_lengths[i]);
-        }
-
-    //将size_t转换为int
-    for (int i = 0; i < world_size; i++) {
-        if (all_address_lengths[i] > INT_MAX) {
-            fprintf(stderr, "Error: Address length too large at index %d\n", i);
-            // 处理错误，例如清理内存并退出
-            free(recvcounts);
-            free(displs);
-            return 1;
-        }
-        recvcounts[i] = (int)all_address_lengths[i];
-    }
+    log_debug("begin to allgather addresses\n");
+    allgather_addresses(g_workers, 2, world_size, world_rank);
+    log_debug("finish allgather addresses\n");
 
 
-    // 准备位移数组
-    displs[0] = 0;
-    for (int i = 1; i < world_size; i++) {
-        displs[i] = displs[i - 1] + recvcounts[i - 1];
-    }
-    if(world_rank == 0)
-        for(int i = 0; i < world_size; i++) {
-            printf("%d\n", displs[i]);
-        }
+    // // 获取本地UCX worker地址
+    // ucp_address_t *local_addr;
+    // size_t local_addr_length;
+    // ucp_worker_get_address(ucp_worker, &local_addr, &local_addr_length);
 
-    // 分配接收缓冲区
-    char *recv_buffer = (char *)malloc(displs[world_size - 1] + recvcounts[world_size - 1]);
-    if(world_rank == 0)
-        printf("recv_buffer size: %d\n", displs[world_size - 1] + recvcounts[world_size - 1]);
+    // // 分配空间以存储所有worker的地址长度和位移
+    // size_t *all_address_lengths = (size_t *)malloc(world_size * sizeof(size_t));
+    // int *displs = (int *)malloc(world_size * sizeof(int));  // 位移数组
+    // int *recvcounts = (int *)malloc(world_size * sizeof(int));
 
-    ucp_address_t **all_worker_addresses = (ucp_address_t **)malloc(world_size * sizeof(ucp_address_t*));
+    // // 通过MPI收集所有进程的地址长度
+    // MPI_Allgather(&local_addr_length, 1, MPI_UNSIGNED_LONG, all_address_lengths, 1, MPI_UNSIGNED_LONG, MPI_COMM_WORLD);
+    // if(world_rank == 0)
+    //     for(int i = 0; i < world_size; i++) {
+    //         printf("%ld\n", all_address_lengths[i]);
+    //     }
+
+    // //将size_t转换为int
+    // for (int i = 0; i < world_size; i++) {
+    //     if (all_address_lengths[i] > INT_MAX) {
+    //         fprintf(stderr, "Error: Address length too large at index %d\n", i);
+    //         // 处理错误，例如清理内存并退出
+    //         free(recvcounts);
+    //         free(displs);
+    //         return 1;
+    //     }
+    //     recvcounts[i] = (int)all_address_lengths[i];
+    // }
 
 
-    // 使用MPI发送和接收所有进程的地址
-    MPI_Allgatherv(local_addr, local_addr_length, MPI_BYTE, recv_buffer, recvcounts, displs, MPI_BYTE, MPI_COMM_WORLD);
+    // // 准备位移数组
+    // displs[0] = 0;
+    // for (int i = 1; i < world_size; i++) {
+    //     displs[i] = displs[i - 1] + recvcounts[i - 1];
+    // }
+    // if(world_rank == 0)
+    //     for(int i = 0; i < world_size; i++) {
+    //         printf("%d\n", displs[i]);
+    //     }
 
-    // 将接收缓冲区中的数据分配给指针数组
-    for (int i = 0; i < world_size; i++) {
-        all_worker_addresses[i] = (ucp_address_t *)(recv_buffer + displs[i]);
-    }
+    // // 分配接收缓冲区
+    // char *recv_buffer = (char *)malloc(displs[world_size - 1] + recvcounts[world_size - 1]);
+    // if(world_rank == 0)
+    //     printf("recv_buffer size: %d\n", displs[world_size - 1] + recvcounts[world_size - 1]);
+
+    // ucp_address_t **all_worker_addresses = (ucp_address_t **)malloc(world_size * sizeof(ucp_address_t*));
+
+
+    // // 使用MPI发送和接收所有进程的地址
+    // MPI_Allgatherv(local_addr, local_addr_length, MPI_BYTE, recv_buffer, recvcounts, displs, MPI_BYTE, MPI_COMM_WORLD);
+
+    // // 将接收缓冲区中的数据分配给指针数组
+    // for (int i = 0; i < world_size; i++) {
+    //     all_worker_addresses[i] = (ucp_address_t *)(recv_buffer + displs[i]);
+    // }
 
     MPI_Finalize();
 
@@ -465,66 +690,101 @@ int main(int argc, char **argv) {
 
 
 
-    ucp_ep_h ep;
-    int i = world_rank ? 0 : 1;
-    if(init_endpoint(ucp_worker, all_worker_addresses[i], &ep) != 0){
-        log_error("init_endpoint failed!\n");
-        return -1;
-    }
+    // ucp_ep_h ep;
+    // int i = world_rank ? 0 : 1;
+    // if(init_endpoint(ucp_worker, all_worker_addresses[i], &ep) != 0){
+    //     log_error("init_endpoint failed!\n");
+    //     return -1;
+    // }
+
+
 
     init_vector_buffer();
     init_chunk_ptrs();
 
+    // if(world_rank == 0){
+    //     if(!chunk_send(ucp_worker, ep, 0, 0)) {
+    //         log_error("Failed to send chunk 0");
+    //     }
+
+    //     if(!recieve_reduce_copy_send(ucp_worker, ep, 1, 1)){
+    //         log_error("Failed to receive reduce copy send");
+    //     }
+
+    //     if(!chunk_recieve(ucp_worker, 0)){
+    //         log_error("Failed to receive chunk 0");
+    //     }
+
+    //     if(check_result_vector_buffer()){
+    //         log_info("Test success");
+    //     }else{
+    //         log_error("Test failed");
+    //     }
+    // }
+    // else {
+    //     if(!chunk_send(ucp_worker, ep, 1, 1)) {
+    //         log_error("Failed to send chunk 0");
+    //     }
+
+    //     if(!recieve_reduce_copy_send(ucp_worker, ep, 0, 0)){
+    //         log_error("Failed to receive reduce copy send");
+    //     }
+
+    //     if(!chunk_recieve(ucp_worker, 1)){
+    //         log_error("Failed to receive chunk 0");
+    //     }
+
+    //     if(check_result_vector_buffer()){
+    //         log_info("Test success");
+    //     }else{
+    //         log_error("Test failed");
+    //     }
+    // }
+    pthread_t tid1;
+    pthread_t tid2;
+
     if(world_rank == 0){
-        if(!chunk_send(ucp_worker, ep, 0, 0)) {
-            log_error("Failed to send chunk 0");
-        }
+        pthread_create(&tid1, NULL, rank0_thread0_communucation, NULL);
+        pthread_create(&tid2, NULL, rank0_thread1_communucation, NULL);
+    
+        pthread_join(tid1, NULL);
+        pthread_join(tid2, NULL);
+    }else{
+        pthread_create(&tid1, NULL, rank1_thread0_communucation, NULL);
+        pthread_create(&tid2, NULL, rank1_thread1_communucation, NULL);
 
-        if(!recieve_reduce_copy_send(ucp_worker, ep, 1, 1)){
-            log_error("Failed to receive reduce copy send");
-        }
-
-        if(!chunk_recieve(ucp_worker, 0)){
-            log_error("Failed to receive chunk 0");
-        }
-
-        if(check_result_vector_buffer()){
-            log_info("Test success");
-        }else{
-            log_error("Test failed");
-        }
-    }
-    else {
-        if(!chunk_send(ucp_worker, ep, 1, 1)) {
-            log_error("Failed to send chunk 0");
-        }
-
-        if(!recieve_reduce_copy_send(ucp_worker, ep, 0, 0)){
-            log_error("Failed to receive reduce copy send");
-        }
-
-        if(!chunk_recieve(ucp_worker, 1)){
-            log_error("Failed to receive chunk 0");
-        }
-
-        if(check_result_vector_buffer()){
-            log_info("Test success");
-        }else{
-            log_error("Test failed");
-        }
+        pthread_join(tid1, NULL);
+        pthread_join(tid2, NULL);
     }
 
-
+    if(check_result_vector_buffer()){
+        log_debug("allreduce Test success");
+    }
+    else{
+        log_error("Test failed");
+    }
 
     // 清理资源
-    free(recv_buffer);
-    free(all_worker_addresses);
-    free(displs);
-    free(all_address_lengths);
+    // free(recv_buffer);
+    // free(all_worker_addresses);
+    // free(displs);
+    // free(all_address_lengths);
     free_chunk_ptrs();
     free_vector_buffer();
-    ucp_worker_release_address(ucp_worker, local_addr);
-    ucp_worker_destroy(ucp_worker);
+    //ucp_worker_release_address(ucp_worker, local_addr);
+    
+    //release all address
+    // for(int i = 0; i < 2; i++){
+    //     ucp_worker_release_address(g_workers[i], g_all_workeraddress[world_rank][i]);
+    // }
+
+
+
+    //destroy all workers
+    for(int i = 0;i < 2; i++ ){
+        ucp_worker_destroy(g_workers[i]);
+    }
+
     ucp_cleanup(ucp_context);
 
     
