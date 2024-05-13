@@ -3,3 +3,7 @@ ucp_hello_world
 test
 .vscode/
 
+xml_parser
+readxml
+mpitest
+mpi_allreduce_test

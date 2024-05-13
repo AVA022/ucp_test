@@ -1,3 +1,9 @@
 gcc myucp.c log.c -o myucp -I. -lucp -lucs -luct -DLOG_USE_COLOR
 
 g++ -std=c++20 ucp_hello_world.cc log.cc -o ucp_hello_world -I. -lucp -lucs -luct -DLOG_USE_COLOR
+
+mpic++ mpitest.cc log.cc xml_parser.cc  -I. -lucs -lucp -luct -o mpitest -DLOG_USE_COLOR $(pkg-config --cflags --libs libxml-2.0)
+
+安装xml解析库，sudo apt-get install libxml2 libxml2-dev
+
+g++ -o xml_parser test.cc xml_parser.cc $(pkg-config --cflags --libs libxml-2.0)

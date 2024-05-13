@@ -378,6 +378,16 @@ static void local_reduce(int *src_vector, int *dst_vector, int size)
     }
 }
 
+
+/**
+ * @brief This function receives a chunk of data, performs a local reduction operation on it, and then sends it to another destination.
+ * 
+ * @param ucp_worker The UCP worker handle.
+ * @param ep The UCP endpoint handle.
+ * @param src_chunk_id The ID of the source chunk.实际上没被用，这取决于xml文件中的配置
+ * @param dst_chunk_id The ID of the destination chunk.既是本地接收的chunk的id，也是目的地的chunk的id
+ * @return Returns true if the operation is successful, false otherwise.
+ */
 static bool recieve_reduce_copy_send(ucp_worker_h ucp_worker, ucp_ep_h ep, int src_chunk_id, ucp_tag_t dst_chunk_id)
 {
     int *scratch_chunk = (int *)malloc((VECTOR_SIZE / NUM_CHUNK) * sizeof(int));
@@ -402,6 +412,35 @@ static bool recieve_reduce_copy_send(ucp_worker_h ucp_worker, ucp_ep_h ep, int s
 
 }
 
+static int init_endpoint(ucp_worker_h ucp_worker, ucp_address_t *peer_addr, ucp_ep_h *ep)
+{
+    ucp_ep_params_t ep_params;
+    ucs_status_t status;
+
+    ep_params.field_mask      = UCP_EP_PARAM_FIELD_REMOTE_ADDRESS |
+                                UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE |
+                                UCP_EP_PARAM_FIELD_ERR_HANDLER |
+                                UCP_EP_PARAM_FIELD_USER_DATA;
+    ep_params.address         = peer_addr;
+    ep_params.err_mode        = err_handling_opt.ucp_err_mode;
+    ep_params.err_handler.cb  = failure_handler;
+    /*
+        void                 *arg;     < User defined argument associated with
+                                        an endpoint, it will be overridden by
+                                        @ref ucp_ep_params_t::user_data if both
+                                        are set. 
+    */
+    ep_params.err_handler.arg = NULL;
+    ep_params.user_data       = &ep_status;
+
+    status = ucp_ep_create(ucp_worker, &ep_params, ep);
+    if(status != UCS_OK){
+        return -1;
+    }
+
+    return 0;
+}
+
 static int run_ucx_client(ucp_worker_h ucp_worker,
                           ucp_address_t *local_addr, size_t local_addr_len,
                           ucp_address_t *peer_addr, size_t peer_addr_len)
@@ -419,18 +458,22 @@ static int run_ucx_client(ucp_worker_h ucp_worker,
     char *str;
 
     /* Send client UCX address to server */
-    ep_params.field_mask      = UCP_EP_PARAM_FIELD_REMOTE_ADDRESS |
-                                UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE |
-                                UCP_EP_PARAM_FIELD_ERR_HANDLER |
-                                UCP_EP_PARAM_FIELD_USER_DATA;
-    ep_params.address         = peer_addr;
-    ep_params.err_mode        = err_handling_opt.ucp_err_mode;
-    ep_params.err_handler.cb  = failure_handler;
-    ep_params.err_handler.arg = NULL;
-    ep_params.user_data       = &ep_status;
+    // ep_params.field_mask      = UCP_EP_PARAM_FIELD_REMOTE_ADDRESS |
+    //                             UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE |
+    //                             UCP_EP_PARAM_FIELD_ERR_HANDLER |
+    //                             UCP_EP_PARAM_FIELD_USER_DATA;
+    // ep_params.address         = peer_addr;
+    // ep_params.err_mode        = err_handling_opt.ucp_err_mode;
+    // ep_params.err_handler.cb  = failure_handler;
+    // ep_params.err_handler.arg = NULL;
+    // ep_params.user_data       = &ep_status;
 
-    status = ucp_ep_create(ucp_worker, &ep_params, &server_ep);
-    CHKERR_JUMP(status != UCS_OK, "ucp_ep_create\n", err);
+    // status = ucp_ep_create(ucp_worker, &ep_params, &server_ep);
+    // CHKERR_JUMP(status != UCS_OK, "ucp_ep_create\n", err);
+    if(init_endpoint(ucp_worker, peer_addr, &server_ep)!=0){
+        log_error("Failed to init endpoint");
+        goto err;
+    }
 
     msg_len = sizeof(*msg) + local_addr_len;
     msg     = (struct msg*)malloc(msg_len); // Cast the return value of malloc to the appropriate pointer type
@@ -746,6 +789,73 @@ err:
 static void progress_worker(void *arg)
 {
     ucp_worker_progress((ucp_worker_h)arg);
+}
+
+static int init_context(ucp_context_h *ucp_context_p){
+    ucp_params_t ucp_params;
+    ucp_config_t *config;
+    ucs_status_t status;
+
+    memset(&ucp_params, 0, sizeof(ucp_params));
+
+    status = ucp_config_read(NULL, NULL, &config);
+    if(status != UCS_OK){
+        log_error("ucp_config_read failed!\n");
+        return -1;
+    }
+
+    ucp_params.field_mask   = UCP_PARAM_FIELD_FEATURES |
+                              UCP_PARAM_FIELD_REQUEST_SIZE |
+                              UCP_PARAM_FIELD_REQUEST_INIT |
+                              UCP_PARAM_FIELD_NAME|
+                              UCP_PARAM_FIELD_MT_WORKERS_SHARED;
+    ucp_params.features     = UCP_FEATURE_TAG;
+    ucp_params.mt_workers_shared = 1;
+    if (ucp_test_mode == TEST_MODE_WAIT || ucp_test_mode == TEST_MODE_EVENTFD) {
+        ucp_params.features |= UCP_FEATURE_WAKEUP;
+    }
+    ucp_params.request_size    = sizeof(struct ucx_context);
+    ucp_params.request_init    = request_init;
+    ucp_params.name            = "hello_world";
+
+    status = ucp_init(&ucp_params, config, ucp_context_p);
+
+    if (print_config) {
+        ucp_config_print(config, stdout, NULL, UCS_CONFIG_PRINT_CONFIG);
+    }
+
+    ucp_config_release(config);
+    if(status != UCS_OK){
+        log_error("ucp_init failed!\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int init_worker(ucp_context_h ucp_context, ucp_worker_h *ucp_worker_p){
+    ucp_worker_attr_t worker_attr;
+    ucp_worker_params_t worker_params;
+    ucs_status_t status;
+
+    worker_params.field_mask  = UCP_WORKER_PARAM_FIELD_THREAD_MODE;
+    worker_params.thread_mode = UCS_THREAD_MODE_SERIALIZED;
+
+    status = ucp_worker_create(ucp_context, &worker_params, ucp_worker_p);
+    if(status != UCS_OK){
+        log_error("ucp_worker_create failed!\n");
+        return -1;
+    }
+
+    worker_attr.field_mask = UCP_WORKER_ATTR_FIELD_ADDRESS;
+
+    status = ucp_worker_query(*ucp_worker_p, &worker_attr);
+    if(status != UCS_OK){
+        log_error("ucp_worker_query failed!\n");
+        return -1;
+    }
+
+    return 0;
 }
 
 int main(int argc, char **argv)
