@@ -12,6 +12,10 @@ enum op_type op_string_to_enmu(std::string string){
         return op_type::REDUCE;
     } else if (string == "rrc") {
         return op_type::RECV_REDUCE_COPY;
+    } else if (string == "rrs"){
+        return op_type::RECV_REDUCE_SEND;
+    } else if(string == "rcs") {
+        return op_type::RECV_COPY_SEND;
     } else if (string == "rrcs") {
         return op_type::RECV_REDUCE_COPY_SEND;
     }
@@ -37,7 +41,7 @@ void XMLParser::parseXMLAndFillStructs(const std::string& filename) {
     }
 
     xmlNode* root_element = xmlDocGetRootElement(doc);
-
+    this->nchunksperloop = std::atoi((const char*)xmlGetProp(root_element, (const xmlChar*)"nchunksperloop"));
     for (xmlNode* node = root_element->children; node; node = node->next) {
         if (node->type == XML_ELEMENT_NODE && strcmp((const char*)node->name, "gpu") == 0) {
             parseRank(node);

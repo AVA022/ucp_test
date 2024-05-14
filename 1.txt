@@ -7,3 +7,45 @@ mpic++ mpitest.cc log.cc xml_parser.cc  -I. -lucs -lucp -luct -o mpitest -DLOG_U
 安装xml解析库，sudo apt-get install libxml2 libxml2-dev
 
 g++ -o xml_parser test.cc xml_parser.cc $(pkg-config --cflags --libs libxml-2.0)
+
+
+MCA coll tuned: parameter "coll_tuned_allreduce_algorithm" (current
+                          value: "ignore", data source: default, level: 5
+                          tuner/detail, type: int)
+                          Which allreduce algorithm is used. Can be locked
+                          down to any of: 0 ignore, 1 basic linear, 2
+                          nonoverlapping (tuned reduce + tuned bcast), 3
+                          recursive doubling, 4 ring, 5 segmented ring. Only
+                          relevant if coll_tuned_use_dynamic_rules is true.
+                          Valid values: 0:"ignore", 1:"basic_linear",
+                          2:"nonoverlapping", 3:"recursive_doubling",
+                          4:"ring", 5:"segmented_ring", 6:"rabenseifner"
+          MCA coll tuned: parameter
+                          "coll_tuned_allreduce_algorithm_segmentsize"
+                          (current value: "0", data source: default, level: 5
+                          tuner/detail, type: int)
+                          Segment size in bytes used by default for allreduce
+                          algorithms. Only has meaning if algorithm is forced
+                          and supports segmenting. 0 bytes means no
+                          segmentation.
+          MCA coll tuned: parameter
+                          "coll_tuned_allreduce_algorithm_tree_fanout"
+                          (current value: "4", data source: default, level: 5
+                          tuner/detail, type: int)
+                          Fanout for n-tree used for allreduce algorithms.
+                          Only has meaning if algorithm is forced and
+                          supports n-tree topo based operation.
+          MCA coll tuned: parameter
+                          "coll_tuned_allreduce_algorithm_chain_fanout"
+                          (current value: "4", data source: default, level: 5
+                          tuner/detail, type: int)
+                          Fanout for chains used for allreduce algorithms.
+                          Only has meaning if algorithm is forced and
+                          supports chain topo based operation.
+
+--mca coll_tuned_use_dynamic_rules 1 \
+--mca coll_tuned_allreduce_algorithm 3 \
+--mca coll_tuned_allreduce_algorithm_segmentsize 4096 \
+--mca coll_tuned_allreduce_algorithm_tree_fanout 4
+
+https://github.com/open-mpi/ompi/issues/11042#issuecomment-1307619353

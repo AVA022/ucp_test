@@ -92,7 +92,7 @@ static const ucp_tag_t tag_mask = UINT64_MAX;
 static const char *addr_msg_str = "UCX address message";
 static const char *data_msg_str = "UCX data message";
 static int print_config         = 0;
-static int * vector_buffer;
+static int * input_buffer;
 static int ** chunk_ptrs;
 
 static const int VECTOR_SIZE = 64;
@@ -106,7 +106,7 @@ static bool init_chunk_ptrs()
     }
 
     for (int i = 0; i < NUM_CHUNK; i++) {
-        chunk_ptrs[i] = vector_buffer + i * VECTOR_SIZE / NUM_CHUNK;
+        chunk_ptrs[i] = input_buffer + i * VECTOR_SIZE / NUM_CHUNK;
     }
 
     return true;
@@ -119,13 +119,13 @@ static void free_chunk_ptrs()
 
 static int init_vector_buffer()
 {
-    vector_buffer = (int *)malloc(VECTOR_SIZE * sizeof(int));
-    if (vector_buffer == NULL) {
+    input_buffer = (int *)malloc(VECTOR_SIZE * sizeof(int));
+    if (input_buffer == NULL) {
         return -1;
     }
 
     for (int i = 0; i < VECTOR_SIZE; i++) {
-        vector_buffer[i] = i;
+        input_buffer[i] = i;
     }
 
     return 0;
@@ -133,13 +133,13 @@ static int init_vector_buffer()
 
 static void free_vector_buffer()
 {
-    free(vector_buffer);
+    free(input_buffer);
 }
 
 static bool check_result_vector_buffer()
 {
     for (int i = 0; i < VECTOR_SIZE; i++) {
-        if (vector_buffer[i] != 2 * i) {
+        if (input_buffer[i] != 2 * i) {
             return false;
         }
     }

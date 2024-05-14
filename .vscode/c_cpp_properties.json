@@ -3,7 +3,9 @@
         {
             "name": "Linux",
             "includePath": [
-                "${workspaceFolder}/**"
+                "${workspaceFolder}/**",
+                "/usr/mpi/gcc/openmpi-4.1.7a1/include/",
+                "/usr/include/libxml2"
             ],
             "defines": [
                 "__linux__",

@@ -21,6 +21,8 @@ enum op_type{
     RECV,
     REDUCE,
     RECV_REDUCE_COPY,
+    RECV_COPY_SEND,
+    RECV_REDUCE_SEND,
     RECV_REDUCE_COPY_SEND,
     OP_UNKNOWN
 };
@@ -60,6 +62,7 @@ public:
     void parseXMLAndFillStructs(const std::string& filename);
     void displayRanks(); // Utility function to display GPU information
     std::vector<std::shared_ptr<Rank>> ranks;
+    int nchunksperloop;
 private:
     void parseRank(xmlNode* node);
     void parseThreadBlock(xmlNode* node, std::shared_ptr<Rank>& rank);

@@ -16,10 +16,10 @@ int main(int argc, char** argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    // 预热网络
+    //预热网络
     warmup(MPI_COMM_WORLD, 1048576);
 
-    // 主测试循环
+    //主测试循环
     for (int n = 256; n <= 1048576; n *= 2) {
         std::vector<int> sendbuf(n, rank);  // 使用 int 类型
         std::vector<int> recvbuf(n, 0);     // 使用 int 类型
@@ -36,7 +36,7 @@ int main(int argc, char** argv) {
                       << " seconds, Transfer rate: " << transferRate << " MB/s" << std::endl;
         }
     }
-
+    
     MPI_Finalize();
     return 0;
 }

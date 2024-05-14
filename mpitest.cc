@@ -7,8 +7,11 @@
 #include <pthread.h>
 #include <semaphore.h>
 #include <sys/time.h>
+
 #include <xml_parser.h>
+
 #include <unordered_map>
+#include <chrono>
 
 struct ucx_context {
     int             completed;
@@ -20,10 +23,17 @@ static const char *data_msg_str = "UCX data message";
 static const ucp_tag_t tag      = 0x1337a880u;
 static const ucp_tag_t tag_mask = UINT64_MAX;
 
-static int * vector_buffer;
-static int ** chunk_ptrs;
-static int VECTOR_SIZE = 1024;
-static int NUM_CHUNK = 2;
+static int * input_buffer;
+static int ** input_chunk_ptrs;
+int * output_buffer;
+int ** output_chunk_buffer;
+int * scratch_buffer;
+int ** scratch_chunk_buffer;
+
+
+
+static int BUFFER_SIZE_INT = 1024;
+int CHUNK_SIZE_INT;
 
 static ucp_address_t*** g_all_workeraddress;
 static ucp_worker_h *g_workers;
@@ -37,34 +47,86 @@ XMLParser xmlparser;
 
 std::unordered_map<std::string, sem_t*> sem_hash;
 
-static bool init_chunk_ptrs()
-{
-    chunk_ptrs = (int **)malloc(NUM_CHUNK * sizeof(int *));
-    if (chunk_ptrs == NULL) {
-        return false;
-    }
+// static bool init_chunk_ptrs(int chunk_num, enum buffer_type type)
+// {
+//     int ***chunk_ptrs_p;
+//     switch(type){
+//         case INPUT:
+//             chunk_ptrs_p = &input_chunk_ptrs;
+//             break;
+//         case OUTPUT:
+//             chunk_ptrs_p = &output_chunk_buffer;
+//             break;
+//         case SCRATCH:
+//             chunk_ptrs_p = &scratch_chunk_buffer;
+//             break;
+//     }
+//     *chunk_ptrs_p = (int **)malloc(chunk_num * sizeof(int *));
+//     if (*chunk_ptrs_p == NULL) {
+//         return false;
+//     }
 
-    for (int i = 0; i < NUM_CHUNK; i++) {
-        chunk_ptrs[i] = vector_buffer + i * VECTOR_SIZE / NUM_CHUNK;
-    }
+//     for (int i = 0; i < NUM_CHUNK; i++) {
+//         *chunk_ptrs_p[i] = input_buffer + i * VECTOR_SIZE / NUM_CHUNK;
+//     }
 
-    return true;
-}
+//     return true;
+// }
 
 static void free_chunk_ptrs()
 {
-    free(chunk_ptrs);
+    //free(input_chunk_ptrs);
 }
 
-static int init_vector_buffer()
+static int init_buffer_chunk(int chunk_num, enum buffer_type type)
 {
-    vector_buffer = (int *)malloc(VECTOR_SIZE * sizeof(int));
-    if (vector_buffer == NULL) {
+    //初始化buffer
+    int **buffer;
+    switch (type)
+    {
+    case INPUT:
+        buffer = &input_buffer;
+        //log_debug("init input_buffer\n");
+        break;
+    case OUTPUT:
+        buffer = &output_buffer;
+        break;
+    case SCRATCH:
+        buffer = &scratch_buffer;
+        break;
+    }
+
+    *buffer = (int *)malloc(CHUNK_SIZE_INT * chunk_num * sizeof(int));
+    if (*buffer == NULL) {
         return -1;
     }
 
-    for (int i = 0; i < VECTOR_SIZE; i++) {
-        vector_buffer[i] = i;
+    //log_debug("start init buffer\n");
+    for (int i = 0; i < CHUNK_SIZE_INT * chunk_num; i++) {
+        (*buffer)[i]= i;
+    }
+    //log_debug("init buffer success\n");
+
+    //初始化指向chunk的指针
+    int ***chunk_ptrs_p;
+    switch(type){
+        case INPUT:
+            chunk_ptrs_p = &input_chunk_ptrs;
+            break;
+        case OUTPUT:
+            chunk_ptrs_p = &output_chunk_buffer;
+            break;
+        case SCRATCH:
+            chunk_ptrs_p = &scratch_chunk_buffer;
+            break;
+    }
+    *chunk_ptrs_p = (int **)malloc(chunk_num * sizeof(int *));
+    if (*chunk_ptrs_p == NULL) {
+        return false;
+    }
+
+    for (int i = 0; i < chunk_num; i++) {
+        (*chunk_ptrs_p)[i] = *buffer + i * CHUNK_SIZE_INT;
     }
 
     return 0;
@@ -72,13 +134,14 @@ static int init_vector_buffer()
 
 static void free_vector_buffer()
 {
-    free(vector_buffer);
+    //free(input_buffer);
 }
 
 static bool check_result_vector_buffer()
 {
-    for (int i = 0; i < VECTOR_SIZE; i++) {
-        if (vector_buffer[i] != 2 * i) {
+    for (int i = 0; i < BUFFER_SIZE_INT; i++) {
+        //printf("input_buffer[%d] = %d\n", i, input_buffer[i]);
+        if (input_buffer[i] != 4 * i) {
             return false;
         }
     }
@@ -155,7 +218,7 @@ static int init_worker(ucp_context_h ucp_context, ucp_worker_h *ucp_worker_p){
     memset(&worker_params, 0, sizeof(worker_params));
 
     worker_params.field_mask  = UCP_WORKER_PARAM_FIELD_THREAD_MODE;
-    worker_params.thread_mode = UCS_THREAD_MODE_SERIALIZED;
+    worker_params.thread_mode = UCS_THREAD_MODE_SINGLE;
 
     status = ucp_worker_create(ucp_context, &worker_params, ucp_worker_p);
     if(status != UCS_OK){
@@ -250,8 +313,7 @@ static int receive_block(ucp_worker_h ucp_worker, ucp_tag_t tag,ucp_tag_t tag_ma
     }
 
     recv_param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
-                              UCP_OP_ATTR_FIELD_DATATYPE |
-                              UCP_OP_ATTR_FLAG_NO_IMM_CMPL;
+                              UCP_OP_ATTR_FIELD_DATATYPE ;
     recv_param.datatype     = ucp_dt_make_contig(1);
     recv_param.cb.recv      = recv_handler;
 
@@ -303,8 +365,8 @@ static int send_block(ucp_worker_h ucp_worker, ucp_ep_h ep, void * buffer, ucp_t
 }
 
 static bool chunk_send(ucp_worker_h ucp_worker, ucp_ep_h ep, int src_chunk_id, ucp_tag_t dst_chunk_id)
-{
-    int ret = send_block(ucp_worker, ep, chunk_ptrs[src_chunk_id], dst_chunk_id, tag_mask, (VECTOR_SIZE / NUM_CHUNK) * sizeof(int));
+{   
+    int ret = send_block(ucp_worker, ep, input_chunk_ptrs[src_chunk_id], dst_chunk_id, tag_mask, CHUNK_SIZE_INT * sizeof(int));
     if (ret != 0) {
         return false;
     }
@@ -313,7 +375,7 @@ static bool chunk_send(ucp_worker_h ucp_worker, ucp_ep_h ep, int src_chunk_id, u
 
 static bool chunk_recieve(ucp_worker_h ucp_worker, ucp_tag_t chunk_id)
 {
-    int ret = receive_block(ucp_worker, chunk_id, tag_mask, chunk_ptrs[chunk_id]);
+    int ret = receive_block(ucp_worker, chunk_id, tag_mask, input_chunk_ptrs[chunk_id]);
     if (ret != 0) {
         return false;
     }
@@ -324,6 +386,9 @@ static void local_reduce(int *src_vector, int *dst_vector, int size)
 {
     for(int i = 0; i < size; i++)
     {
+        if(world_rank == 0){
+            //log_debug("src_vector[%d]: %d, dst_vector[%d]: %d", i, src_vector[i], i, dst_vector[i]);
+        }
         dst_vector[i] += src_vector[i];
     }
 }
@@ -336,18 +401,18 @@ static void local_reduce(int *src_vector, int *dst_vector, int size)
  * @param ep The UCP endpoint handle.
  * @param src_chunk_id The ID of the source chunk.实际上没被用，这取决于xml文件中的配置
  * @param dst_chunk_id The ID of the destination chunk.既是本地接收的chunk的id，也是目的地的chunk的id
- * @return Returns true if the operation is successful, false otherwise.
+ * @return Returns 0 on success, -1 on failure.
  */
-static bool recieve_reduce_copy_send(ucp_worker_h ucp_worker, ucp_ep_h ep, int src_chunk_id, ucp_tag_t dst_chunk_id)
+static int recieve_reduce_copy_send(ucp_worker_h ucp_worker, ucp_ep_h ep, int src_chunk_id, ucp_tag_t dst_chunk_id)
 {
-    int *scratch_chunk = (int *)malloc((VECTOR_SIZE / NUM_CHUNK) * sizeof(int));
+    int *scratch_chunk = (int *)malloc(CHUNK_SIZE_INT * sizeof(int));
 
     if(receive_block(ucp_worker, dst_chunk_id, tag_mask, scratch_chunk) != 0){
         log_error("Failed to receive chunk from %d", src_chunk_id);
-        return false;
+        return -1;
     }
 
-    local_reduce(scratch_chunk, chunk_ptrs[dst_chunk_id], (VECTOR_SIZE / NUM_CHUNK));
+    local_reduce(scratch_chunk, input_chunk_ptrs[dst_chunk_id], CHUNK_SIZE_INT);
 
     //假装copy了，感觉在cpu中没什么区别
     free(scratch_chunk);
@@ -355,29 +420,67 @@ static bool recieve_reduce_copy_send(ucp_worker_h ucp_worker, ucp_ep_h ep, int s
 
     if(!chunk_send(ucp_worker, ep, dst_chunk_id, dst_chunk_id)){
         log_error("Failed to send chunk to %d", dst_chunk_id);
-        return false;
+        return -1;
     }
 
-    return true;
+    return 0;
+}
 
+static int recieve_reduce_send(ucp_worker_h ucp_worker, ucp_ep_h ep, int src_chunk_id, ucp_tag_t dst_chunk_id){
+    int *scratch_chunk = (int *)malloc(CHUNK_SIZE_INT * sizeof(int));
+
+    if(receive_block(ucp_worker, dst_chunk_id, tag_mask, scratch_chunk) != 0){
+        log_error("Failed to receive chunk from %d", src_chunk_id);
+        return -1;
+    }
+
+    local_reduce(scratch_chunk, input_chunk_ptrs[dst_chunk_id], CHUNK_SIZE_INT);
+
+    free(scratch_chunk);
+
+
+    if(!chunk_send(ucp_worker, ep, dst_chunk_id, dst_chunk_id)){
+        log_error("Failed to send chunk to %d", dst_chunk_id);
+        return -1;
+    }
+
+    return 0;
 }
 
 static int recieve_reduce_copy(ucp_worker_h ucp_worker, int src_chunk_id, ucp_tag_t dst_chunk_id)
 {
-    int *scratch_chunk = (int *)malloc((VECTOR_SIZE / NUM_CHUNK) * sizeof(int));
+    int *scratch_chunk = (int *)malloc(CHUNK_SIZE_INT * sizeof(int));
     //log_debug("aaaaaaaaaaaaaa %d", scratch_chunk[0]);
     if(receive_block(ucp_worker, dst_chunk_id, tag_mask, scratch_chunk) != 0){
         log_error("Failed to receive chunk from %d", src_chunk_id);
         return -1;
     }
     //log_debug("aaaaaaaaaaaaaa %d", scratch_chunk[0]);
-    local_reduce(scratch_chunk, chunk_ptrs[dst_chunk_id], (VECTOR_SIZE / NUM_CHUNK));
+    local_reduce(scratch_chunk, input_chunk_ptrs[dst_chunk_id], CHUNK_SIZE_INT);
 
     //假装copy了，感觉在cpu中没什么区别
     free(scratch_chunk);
 
     return 0;
 
+}
+
+
+
+static int recieve_copy_send(ucp_worker_h ucp_worker, ucp_ep_h ep, int src_chunk_id, enum buffer_type src_buffer,
+                            ucp_tag_t dst_chunk_id, enum buffer_type dst_buffer){
+
+    if(!chunk_recieve(ucp_worker, dst_chunk_id)){
+        log_error("Failed to receive chunk from %d", src_chunk_id);
+        return -1;
+    }
+
+    if(!chunk_send(ucp_worker, ep, dst_chunk_id, dst_chunk_id)){
+        log_error("Failed to send chunk to %d", dst_chunk_id);
+        return -1;
+    }
+
+    return 0;
 }
 
 static int init_endpoint(ucp_worker_h ucp_worker, ucp_address_t *peer_addr, ucp_ep_h *ep)
@@ -522,7 +625,7 @@ static int rank0_comunication(){
         return -1;
     }
 
-    chunk_ptrs[0][0] = 100;
+    input_chunk_ptrs[0][0] = 100;
     if(chunk_send(g_workers[0], ep, 0, 0) != true){
         log_error("chunk_send failed!\n");
         return -1;
@@ -537,7 +640,7 @@ static int rank1_comunication(){
         return -1;
     }
 
-    log_debug("chunk_ptrs[0][0]: %d\n", chunk_ptrs[0][0]);
+    log_debug("input_chunk_ptrs[0][0]: %d\n", input_chunk_ptrs[0][0]);
     return 0;
 }
 
@@ -640,6 +743,7 @@ void* interpreter(void* arg){
         connect_to_peer(world_rank, tb->send, worker, &ep);
     }
 
+    auto start = std::chrono::high_resolution_clock::now();
     for(const auto& step: tb->steps){
         if(step->depid != -1){
             std::string hash_key = std::to_string(step->depid) + "/" + std::to_string(step->deps);
@@ -672,8 +776,20 @@ void* interpreter(void* arg){
 
         case RECV_REDUCE_COPY_SEND:
             log_debug("rankid:%d tbid:%d start recieve_reduce_copy_send  / send srcoff: %d / dstoff: %d", world_rank, tb_id, step->srcoff, step->dstoff);
-            if(recieve_reduce_copy_send(worker, ep, step->srcoff, step->dstoff) != true){
+            if(recieve_reduce_copy_send(worker, ep, step->srcoff, step->dstoff) != 0){
                 log_error("recieve_reduce_copy_send failed!\n");
+            }
+            break;
+        case RECV_REDUCE_SEND:
+            log_debug("rankid:%d tbid:%d start recieve_reduce_send  / send srcoff: %d / dstoff: %d", world_rank, tb_id, step->srcoff, step->dstoff);
+            if(recieve_reduce_send(worker, ep, step->srcoff, step->dstoff) != 0){
+                log_error("recieve_reduce_send failed!\n");
+            }
+            break;
+        case RECV_COPY_SEND:
+            log_debug("rankid:%d tbid:%d start recieve_copy_send  / send srcoff: %d / dstoff: %d", world_rank, tb_id, step->srcoff, step->dstoff);
+            if(recieve_copy_send(worker, ep, step->srcoff, INPUT, step->dstoff, OUTPUT) != 0){
+                log_error("recieve_copy_send failed!\n");
             }
             break;
 
@@ -686,6 +802,11 @@ void* interpreter(void* arg){
             sem_post(sem_hash[hash_key]);
         }
     }
+
+    auto end = std::chrono::high_resolution_clock::now();  // 结束时间
+    std::chrono::duration<double, std::milli> elapsed = end - start;  // 计算耗时
+    log_info("time cost: %f s", 0.001 * elapsed.count());
+
     return NULL;
 }
 
@@ -704,15 +825,24 @@ int start_thread(){
     return 0;
 }
 
-int init_buffer_pool(){
-    if(init_vector_buffer() != 0){
-        log_error("init_vector_buffer failed!\n");
-        return -1;
+int init_buffer_pool(int buffer_size_int){
+    BUFFER_SIZE_INT = buffer_size_int;
+    auto& rank_intr = xmlparser.ranks[world_rank];
+    CHUNK_SIZE_INT = buffer_size_int / xmlparser.nchunksperloop;
+
+    if(rank_intr->i_chunks != 0){
+        if(init_buffer_chunk(rank_intr->i_chunks, INPUT) != 0){
+            log_error("init_buffer_chunk failed!\n");
+            return -1;
+        }
     }
 
-    if(!init_chunk_ptrs()){
-        log_error("init_chunk_ptrs failed!\n");
-        return -1;
+    if(rank_intr->o_chunks != 0){
+        init_buffer_chunk(rank_intr->o_chunks, OUTPUT);
+    }
+
+    if(rank_intr->s_chunks != 0){
+        init_buffer_chunk(rank_intr->s_chunks, SCRATCH);
     }
 
     return 0;
@@ -720,10 +850,11 @@ int init_buffer_pool(){
 
 int main(int argc, char **argv) {
     xmlparser.parseXMLAndFillStructs("allreduce_better.xml");
-    xmlparser.displayRanks();
+    //xmlparser.displayRanks();
     //log_info("%d", xmlparser.ranks[0]->tbs[0]->steps[0]->hasdep);
     //alocate g_workers
     g_workers = (ucp_worker_h *)malloc(2 * sizeof(ucp_worker_h));
+    //log_info("%d", xmlparser.nchunksperloop);
 
 
 
@@ -759,147 +890,24 @@ int main(int argc, char **argv) {
     log_debug("finish allgather addresses\n");
 
 
-    // // 获取本地UCX worker地址
-    // ucp_address_t *local_addr;
-    // size_t local_addr_length;
-    // ucp_worker_get_address(ucp_worker, &local_addr, &local_addr_length);
 
-    // // 分配空间以存储所有worker的地址长度和位移
-    // size_t *all_address_lengths = (size_t *)malloc(world_size * sizeof(size_t));
-    // int *displs = (int *)malloc(world_size * sizeof(int));  // 位移数组
-    // int *recvcounts = (int *)malloc(world_size * sizeof(int));
-
-    // // 通过MPI收集所有进程的地址长度
-    // MPI_Allgather(&local_addr_length, 1, MPI_UNSIGNED_LONG, all_address_lengths, 1, MPI_UNSIGNED_LONG, MPI_COMM_WORLD);
-    // if(world_rank == 0)
-    //     for(int i = 0; i < world_size; i++) {
-    //         printf("%ld\n", all_address_lengths[i]);
-    //     }
-
-    // //将size_t转换为int
-    // for (int i = 0; i < world_size; i++) {
-    //     if (all_address_lengths[i] > INT_MAX) {
-    //         fprintf(stderr, "Error: Address length too large at index %d\n", i);
-    //         // 处理错误，例如清理内存并退出
-    //         free(recvcounts);
-    //         free(displs);
-    //         return 1;
-    //     }
-    //     recvcounts[i] = (int)all_address_lengths[i];
-    // }
-
-
-    // // 准备位移数组
-    // displs[0] = 0;
-    // for (int i = 1; i < world_size; i++) {
-    //     displs[i] = displs[i - 1] + recvcounts[i - 1];
-    // }
-    // if(world_rank == 0)
-    //     for(int i = 0; i < world_size; i++) {
-    //         printf("%d\n", displs[i]);
-    //     }
-
-    // // 分配接收缓冲区
-    // char *recv_buffer = (char *)malloc(displs[world_size - 1] + recvcounts[world_size - 1]);
-    // if(world_rank == 0)
-    //     printf("recv_buffer size: %d\n", displs[world_size - 1] + recvcounts[world_size - 1]);
-
-    // ucp_address_t **all_worker_addresses = (ucp_address_t **)malloc(world_size * sizeof(ucp_address_t*));
-
-
-    // // 使用MPI发送和接收所有进程的地址
-    // MPI_Allgatherv(local_addr, local_addr_length, MPI_BYTE, recv_buffer, recvcounts, displs, MPI_BYTE, MPI_COMM_WORLD);
-
-    // // 将接收缓冲区中的数据分配给指针数组
-    // for (int i = 0; i < world_size; i++) {
-    //     all_worker_addresses[i] = (ucp_address_t *)(recv_buffer + displs[i]);
-    // }
 
     MPI_Finalize();
 
-    // 用收到的地址创建UCP端点
-    // if (world_rank != 0) { // 示例：每个非0号进程与0号进程建立连接
-    //     ucp_ep_h ep;
-    //     ucp_ep_params_t ep_params;
-    //     ucs_status_t status;
-    //     ep_params.field_mask = UCP_EP_PARAM_FIELD_REMOTE_ADDRESS;
-    //     ep_params.address = all_worker_addresses[0];  // 此处假设0号进程的地址位于数组开始位置
-    //     status= ucp_ep_create(ucp_worker, &ep_params, &ep);
-    //     if(status != UCS_OK){
-    //         log_error("ucp_ep_create failed!\n");
-    //         return -1;
-    //     }
-    // }
+    init_buffer_pool(1024 * 1024);
+    // for(int i = 0; i < CHUNK_SIZE_INT; i ++)
+    //     log_info("%d", input_chunk_ptrs[3][i]);
 
-
-
-    // ucp_ep_h ep;
-    // int i = world_rank ? 0 : 1;
-    // if(init_endpoint(ucp_worker, all_worker_addresses[i], &ep) != 0){
-    //     log_error("init_endpoint failed!\n");
-    //     return -1;
-    // }
-
-
-
-    init_vector_buffer();
-    init_chunk_ptrs();
-
-    // if(world_rank == 0){
-    //     if(!chunk_send(ucp_worker, ep, 0, 0)) {
-    //         log_error("Failed to send chunk 0");
-    //     }
-
-    //     if(!recieve_reduce_copy_send(ucp_worker, ep, 1, 1)){
-    //         log_error("Failed to receive reduce copy send");
-    //     }
-
-    //     if(!chunk_recieve(ucp_worker, 0)){
-    //         log_error("Failed to receive chunk 0");
-    //     }
-
-    //     if(check_result_vector_buffer()){
-    //         log_info("Test success");
-    //     }else{
-    //         log_error("Test failed");
-    //     }
-    // }
-    // else {
-    //     if(!chunk_send(ucp_worker, ep, 1, 1)) {
-    //         log_error("Failed to send chunk 0");
-    //     }
-
-    //     if(!recieve_reduce_copy_send(ucp_worker, ep, 0, 0)){
-    //         log_error("Failed to receive reduce copy send");
-    //     }
-
-    //     if(!chunk_recieve(ucp_worker, 1)){
-    //         log_error("Failed to receive chunk 0");
-    //     }
-
-    //     if(check_result_vector_buffer()){
-    //         log_info("Test success");
-    //     }else{
-    //         log_error("Test failed");
-    //     }
-    // }
-    // pthread_t tid1;
-    // pthread_t tid2;
-
-    // if(world_rank == 0){
-    //     pthread_create(&tid1, NULL, rank0_thread0_communucation, NULL);
-    //     pthread_create(&tid2, NULL, rank0_thread1_communucation, NULL);
-    
-    //     pthread_join(tid1, NULL);
-    //     pthread_join(tid2, NULL);
-    // }else{
-    //     pthread_create(&tid1, NULL, rank1_thread0_communucation, NULL);
-    //     pthread_create(&tid2, NULL, rank1_thread1_communucation, NULL);
-
-    //     pthread_join(tid1, NULL);
-    //     pthread_join(tid2, NULL);
-    // }
     start_thread();
+    if(input_buffer == NULL){
+        log_error("input_buffer is NULL");
+        return -1;
+    }
+    log_info("start check");
+
+    // if(world_rank == 0)
+    //     for(int i = 0; i < BUFFER_SIZE_INT; i ++)
+    //         log_info("%d", input_buffer[i]);
 
     if(check_result_vector_buffer()){
         log_debug("allreduce Test success");
