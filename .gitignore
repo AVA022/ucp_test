@@ -7,3 +7,6 @@ xml_parser
 readxml
 mpitest
 mpi_allreduce_test
+client
+server
+

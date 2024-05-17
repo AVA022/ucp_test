@@ -17,6 +17,7 @@ enum buffer_type {
 };
 
 enum op_type{
+    NOP,
     SEND,
     RECV,
     REDUCE,

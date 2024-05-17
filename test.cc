@@ -7,7 +7,10 @@ struct MyClass {
 };
 
 int main() {
-    std::cout << std::to_string(0) + "/" + std::to_string(0) << std::endl;
+    int num = 2;
+
+    size_t size = (size_t)num;
+    std::cout << size << std::endl;
 
     return 0;
 }

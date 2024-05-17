@@ -18,6 +18,8 @@ enum op_type op_string_to_enmu(std::string string){
         return op_type::RECV_COPY_SEND;
     } else if (string == "rrcs") {
         return op_type::RECV_REDUCE_COPY_SEND;
+    } else if(string == "nop") {
+        return op_type::NOP;
     }
     return op_type::OP_UNKNOWN;
 }
