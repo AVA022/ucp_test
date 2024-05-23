@@ -14,9 +14,10 @@ ucp_ep_h g_ep;
 
 const char *am_msg_str = "active message";
 int *tempbuffer;
+std::vector<int*> buffer_ptrs;
 
 
-int main(){
+int main(int argc, char **argv){
     ucp_context_h context;
     ucp_listener_h listener;
 
@@ -36,7 +37,16 @@ int main(){
         return -1;
     }
 
-    if(init_endpoint_ip(g_worker, "127.0.0.1", &g_ep) != 0){
+    // 检查命令行参数数量
+    if(argc < 2){
+        log_error("No IP address provided");
+        return -1;
+    }
+
+    // 第一个命令行参数作为 IP 地址
+    char *ip_address = argv[1];
+
+    if(init_endpoint_ip(g_worker, ip_address, 13337, &g_ep) != 0){
         log_error("Failed to initialize endpoint");
         return -1;
     }

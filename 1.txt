@@ -8,6 +8,14 @@ mpic++ mpitest.cc log.cc xml_parser.cc  -I. -lucs -lucp -luct -o mpitest -DLOG_U
 
 g++ -o xml_parser test.cc xml_parser.cc $(pkg-config --cflags --libs libxml-2.0)
 
+g++ -std=c++20 test_am_client_main.cc  log.cc -o client -I. -lucp -lucs -luct -DLOG_USE_COLOR
+g++ -std=c++20 test_am_server_main.cc  log.cc -o server -I. -lucp -lucs -luct -DLOG_USE_COLOR
+
+
+编译offload测试
+mpic++ test_offload.cc log.cc xml_parser.cc  -I. -lucs -lucp -luct -o test_offload -DLOG_USE_COLOR $(pkg-config --cflags --libs libxml-2.0)
+
+g++  test_offload_client.cc  log.cc -o test_offload_client -I. -lucp -lucs -luct -DLOG_USE_COLOR
 
 MCA coll tuned: parameter "coll_tuned_allreduce_algorithm" (current
                           value: "ignore", data source: default, level: 5

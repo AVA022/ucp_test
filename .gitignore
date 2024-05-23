@@ -10,3 +10,5 @@ mpi_allreduce_test
 client
 server
 
+test_offload
+test_offload_client

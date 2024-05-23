@@ -13,7 +13,8 @@
 
 #include <unordered_map>
 #include <chrono>
-
+#include <queue>
+#include <mutex>
 
 static ucs_status_t ep_status   = UCS_OK;
 static const char *data_msg_str = "UCX data message";
@@ -27,7 +28,7 @@ int ** output_chunk_buffer;
 int * scratch_buffer;
 int ** scratch_chunk_buffer;
 
-
+const char *am_msg_str = "active message";
 
 std::chrono::duration<double, std::milli> elapsed;
 
@@ -37,11 +38,14 @@ int CHUNK_SIZE_INT;
 static ucp_address_t*** g_all_workeraddress;
 static ucp_worker_h *g_workers;
 
+pthread_t* g_threads;
+
 static ucp_worker_h server_worker;
 static ucp_ep_h server_ep;
+static ucp_listener_h server_listener;
 
-sem_t sem1;
-sem_t sem2;
+sem_t sem_4_main_wait;
+sem_t sem_4_th_wait;
 
 int world_size, world_rank;
 
@@ -49,9 +53,10 @@ XMLParser xmlparser;
 
 std::unordered_map<std::string, sem_t*> sem_hash;
 
+std::queue<int*> recv_buffer_ptr_queue;
+std::mutex queue_mutex;
 
-
-
+int16_t server_port[2] = {13337, 23337};
 
 static void free_chunk_ptrs()
 {
@@ -736,7 +741,7 @@ void server_conn_handle_cb(ucp_conn_request_h conn_request, void *arg)
     // }
 }
 
-int init_listener(ucp_worker_h ucp_worker, ucp_listener_h *listener_p, const char *address_str)
+int init_listener(ucp_worker_h ucp_worker, ucp_listener_h *listener_p, const char *address_str,int16_t port)
 {
     struct sockaddr_storage listen_addr;
     ucp_listener_params_t listener_params;
@@ -746,7 +751,7 @@ int init_listener(ucp_worker_h ucp_worker, ucp_listener_h *listener_p, const cha
     char ip_str[IP_STRING_LEN];
     char port_str[PORT_STRING_LEN];
 
-    set_sock_addr(address_str, &listen_addr, 13337);
+    set_sock_addr(address_str, &listen_addr, port);
 
     listener_params.field_mask         = UCP_LISTENER_PARAM_FIELD_SOCK_ADDR |
                                          UCP_LISTENER_PARAM_FIELD_CONN_HANDLER;
@@ -817,6 +822,8 @@ ucs_status_t ucp_am_data_cb(void *arg, const void *header, size_t header_length,
         fprintf(stderr, "received unexpected header, length %ld", header_length);
     }
 
+    int *tempbuffer = (int *)malloc(length);
+
     if (param->recv_attr & UCP_AM_RECV_ATTR_FLAG_RNDV) {
         /* Rendezvous request arrived, data contains an internal UCX descriptor,
          * which has to be passed to ucp_am_recv_data_nbx function to confirm
@@ -837,22 +844,21 @@ ucs_status_t ucp_am_data_cb(void *arg, const void *header, size_t header_length,
         
         ucs_status_t status = ucx_wait(server_worker, request, "recv",
                                        am_msg_str);
+        
+        {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        recv_buffer_ptr_queue.push(tempbuffer);
+        }
         return UCS_OK;
     }
 
-    /* Message delivered with eager protocol, data should be available
-     * immediately
-     */
-    // am_data_desc.is_rndv = 0;
 
-    // iov = am_data_desc.recv_buf;
-    // offset = 0;
-    // for (idx = 0; idx < iov_cnt; idx++) {
-    //     mem_type_memcpy(iov[idx].buffer, UCS_PTR_BYTE_OFFSET(data, offset),
-    //                     iov[idx].length);
-    //     offset += iov[idx].length;
-    // }
     memcpy(tempbuffer, data, length);
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        recv_buffer_ptr_queue.push(tempbuffer);
+    }
+    
     return UCS_OK;
 }
 
@@ -882,101 +888,109 @@ void* interpreter(void* arg){
         connect_to_peer(world_rank, tb->send, worker, &ep, tb->chan);
     }
 
-    auto start = std::chrono::high_resolution_clock::now();
-    for(const auto& step: tb->steps){
-        if(step->depid != -1){
-            std::string hash_key = std::to_string(step->depid) + "/" + std::to_string(step->deps);
-            log_info("rankid:%d tbid:%d wait for %s\n", world_rank, tb_id, hash_key.c_str());
-            sem_wait(sem_hash[hash_key]);
+    while(1){
+        sem_wait(&sem_4_th_wait);
+
+        auto start = std::chrono::high_resolution_clock::now();
+        for(const auto& step: tb->steps){
+            if(step->depid != -1){
+                std::string hash_key = std::to_string(step->depid) + "/" + std::to_string(step->deps);
+                log_info("rankid:%d tbid:%d wait for %s\n", world_rank, tb_id, hash_key.c_str());
+                sem_wait(sem_hash[hash_key]);
+            }
+
+            switch (step->type)
+            {
+            case SEND:
+                log_debug("rankid:%d tbid:%d start /  send srcoff: %d / dstoff: %d", world_rank, tb_id, step->srcoff, step->dstoff);
+                if(chunk_send(worker, ep, step->srcbuf ,step->srcoff, step->dstbuf, step->dstoff, step->cnt) != 0){
+                    log_error("chunk_send failed!\n");
+                }
+                break;
+            
+            case RECV:
+                log_debug("rankid:%d tbid:%d start recv / send srcoff: %d / dstoff: %d", world_rank, tb_id, step->srcoff, step->dstoff);
+                if(chunk_recieve(worker, step->dstbuf, step->dstoff, step->cnt) != 0){
+                    log_error("chunk_recieve failed!\n");
+                }
+                break;
+
+            case RECV_REDUCE_COPY:
+                log_debug("rankid:%d tbid:%d start recieve_reduce_copy / send srcoff: %d / dstoff: %d", world_rank, tb_id, step->srcoff, step->dstoff);
+                if(recieve_reduce_copy(worker, ep, step->srcbuf ,step->srcoff, step->dstbuf, step->dstoff, step->cnt) != 0){
+                    log_error("recieve_reduce_copy failed!\n");
+                }
+                break;
+
+            case RECV_REDUCE_COPY_SEND:
+                log_debug("rankid:%d tbid:%d start recieve_reduce_copy_send  / send srcoff: %d / dstoff: %d", world_rank, tb_id, step->srcoff, step->dstoff);
+                if(recieve_reduce_copy_send(worker, ep, step->srcbuf ,step->srcoff, step->dstbuf, step->dstoff, step->cnt) != 0){
+                    log_error("recieve_reduce_copy_send failed!\n");
+                }
+                break;
+
+            case RECV_REDUCE_SEND:
+                log_debug("rankid:%d tbid:%d start recieve_reduce_send  / send srcoff: %d / dstoff: %d", world_rank, tb_id, step->srcoff, step->dstoff);
+                if(recieve_reduce_send(worker, ep, step->srcbuf ,step->srcoff, step->dstbuf, step->dstoff, step->cnt) != 0){
+                    log_error("recieve_reduce_send failed!\n");
+                }
+                break;
+
+            case RECV_COPY_SEND:
+                log_debug("rankid:%d tbid:%d start recieve_copy_send  / send srcoff: %d / dstoff: %d", world_rank, tb_id, step->srcoff, step->dstoff);
+                if(recieve_copy_send(worker, ep, step->srcbuf ,step->srcoff, step->dstbuf, step->dstoff, step->cnt) != 0){
+                    log_error("recieve_copy_send failed!\n");
+                }
+                break;
+
+            case NOP:
+                log_debug("rankid:%d tbid:%d start NOP", world_rank, tb_id);
+                break;
+
+            case REDUCE:
+                log_debug("rankid:%d tbid:%d start reduce  / send srcoff: %d / dstoff: %d", world_rank, tb_id, step->srcoff, step->dstoff);
+                if(reduce(step->srcbuf, step->srcoff, step->dstbuf, step->dstoff, step->cnt) != 0){
+                    log_error("reduce failed!\n");
+                }
+                break;
+
+            default:
+                log_error("unknown step type!\n");
+            }
+            if(step->hasdep != 0){
+                for(int i = 0; i < step->hasdep; i++){
+                    std::string hash_key = std::to_string(tb_id) + "/" + std::to_string(step->s);
+                    log_info("rankid:%d tbid:%d post %s\n", world_rank, tb_id, hash_key.c_str());
+                    sem_post(sem_hash[hash_key]);
+                }      
+            }
         }
 
-        switch (step->type)
-        {
-        case SEND:
-            log_debug("rankid:%d tbid:%d start /  send srcoff: %d / dstoff: %d", world_rank, tb_id, step->srcoff, step->dstoff);
-            if(chunk_send(worker, ep, step->srcbuf ,step->srcoff, step->dstbuf, step->dstoff, step->cnt) != 0){
-                log_error("chunk_send failed!\n");
-            }
-            break;
-        
-        case RECV:
-            log_debug("rankid:%d tbid:%d start recv / send srcoff: %d / dstoff: %d", world_rank, tb_id, step->srcoff, step->dstoff);
-            if(chunk_recieve(worker, step->dstbuf, step->dstoff, step->cnt) != 0){
-                log_error("chunk_recieve failed!\n");
-            }
-            break;
-
-        case RECV_REDUCE_COPY:
-            log_debug("rankid:%d tbid:%d start recieve_reduce_copy / send srcoff: %d / dstoff: %d", world_rank, tb_id, step->srcoff, step->dstoff);
-            if(recieve_reduce_copy(worker, ep, step->srcbuf ,step->srcoff, step->dstbuf, step->dstoff, step->cnt) != 0){
-                log_error("recieve_reduce_copy failed!\n");
-            }
-            break;
-
-        case RECV_REDUCE_COPY_SEND:
-            log_debug("rankid:%d tbid:%d start recieve_reduce_copy_send  / send srcoff: %d / dstoff: %d", world_rank, tb_id, step->srcoff, step->dstoff);
-            if(recieve_reduce_copy_send(worker, ep, step->srcbuf ,step->srcoff, step->dstbuf, step->dstoff, step->cnt) != 0){
-                log_error("recieve_reduce_copy_send failed!\n");
-            }
-            break;
-
-        case RECV_REDUCE_SEND:
-            log_debug("rankid:%d tbid:%d start recieve_reduce_send  / send srcoff: %d / dstoff: %d", world_rank, tb_id, step->srcoff, step->dstoff);
-            if(recieve_reduce_send(worker, ep, step->srcbuf ,step->srcoff, step->dstbuf, step->dstoff, step->cnt) != 0){
-                log_error("recieve_reduce_send failed!\n");
-            }
-            break;
-
-        case RECV_COPY_SEND:
-            log_debug("rankid:%d tbid:%d start recieve_copy_send  / send srcoff: %d / dstoff: %d", world_rank, tb_id, step->srcoff, step->dstoff);
-            if(recieve_copy_send(worker, ep, step->srcbuf ,step->srcoff, step->dstbuf, step->dstoff, step->cnt) != 0){
-                log_error("recieve_copy_send failed!\n");
-            }
-            break;
-
-        case NOP:
-            log_debug("rankid:%d tbid:%d start NOP", world_rank, tb_id);
-            break;
-
-        case REDUCE:
-            log_debug("rankid:%d tbid:%d start reduce  / send srcoff: %d / dstoff: %d", world_rank, tb_id, step->srcoff, step->dstoff);
-            if(reduce(step->srcbuf, step->srcoff, step->dstbuf, step->dstoff, step->cnt) != 0){
-                log_error("reduce failed!\n");
-            }
-            break;
-
-        default:
-            log_error("unknown step type!\n");
-        }
-        if(step->hasdep != 0){
-            for(int i = 0; i < step->hasdep; i++){
-                std::string hash_key = std::to_string(tb_id) + "/" + std::to_string(step->s);
-                log_info("rankid:%d tbid:%d post %s\n", world_rank, tb_id, hash_key.c_str());
-                sem_post(sem_hash[hash_key]);
-            }      
-        }
+        auto end = std::chrono::high_resolution_clock::now();  // 结束时间
+        std::chrono::duration<double, std::milli> temp = end - start;  // 计算耗时
+        elapsed = (elapsed.count() < temp.count()) ? temp : elapsed;  // 计算耗时
+        sem_post(&sem_4_main_wait);
+        //log_info("time cost: %f s", 0.001 * elapsed.count());
     }
-
-    auto end = std::chrono::high_resolution_clock::now();  // 结束时间
-    std::chrono::duration<double, std::milli> temp = end - start;  // 计算耗时
-    elapsed = (elapsed.count() < temp.count()) ? temp : elapsed;  // 计算耗时
-    //log_info("time cost: %f s", 0.001 * elapsed.count());
-
     return NULL;
 }
 
 int start_thread(){
-    pthread_t* threads = (pthread_t *)malloc(xmlparser.ranks[world_rank]->tbs.size() * sizeof(pthread_t));
+    g_threads = (pthread_t *)malloc(xmlparser.ranks[world_rank]->tbs.size() * sizeof(pthread_t));
 
     for(const auto& tb: xmlparser.ranks[world_rank]->tbs){
-        pthread_create(&threads[tb->id], NULL, interpreter, &tb->id);
-    }
-
-    for(const auto& tb: xmlparser.ranks[world_rank]->tbs){
-        pthread_join(threads[tb->id], NULL);
+        pthread_create(&g_threads[tb->id], NULL, interpreter, &tb->id);
     }
     
-    free(threads);
+    return 0;
+}
+
+int wait_threads(){
+    for(const auto& tb: xmlparser.ranks[world_rank]->tbs){
+        pthread_join(g_threads[tb->id], NULL);
+    }
+    
+    free(g_threads);
     return 0;
 }
 
@@ -1004,7 +1018,9 @@ int init_buffer_pool(int buffer_size_int){
 }
 
 int main(int argc, char **argv) {
-    xmlparser.parseXMLAndFillStructs("hierarchical_allreduce_4x2nodes.xml");
+    bool offload_flag = true;
+
+    xmlparser.parseXMLAndFillStructs("allreduce_ring_4_nodes.xml");
     //xmlparser.displayRanks();
     //log_info("%d", xmlparser.ranks[0]->tbs[0]->steps[0]->hasdep);
     //alocate g_workers
@@ -1013,6 +1029,8 @@ int main(int argc, char **argv) {
     log_debug("tb_num: %d", tb_num);
     //log_info("%d", xmlparser.nchunksperloop);
 
+
+    
 
     MPI_Init(&argc, &argv);
 
@@ -1023,6 +1041,8 @@ int main(int argc, char **argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
 
     init_sem_hash(world_rank);
+    sem_init(&sem_4_main_wait, 0, 0);
+    sem_init(&sem_4_th_wait, 0, 0);
 
     // 初始化UCP
     ucp_context_h ucp_context;
@@ -1041,24 +1061,67 @@ int main(int argc, char **argv) {
     log_debug("begin to allgather addresses\n");
     allgather_addresses(g_workers, tb_num, world_size, world_rank);
     log_debug("finish allgather addresses\n");
-
-
-
-
     MPI_Finalize();
 
-    init_buffer_pool(1024 * 1024);
+
+
+    init_buffer_pool(1024 * 1024 * 16);
     // for(int i = 0; i < CHUNK_SIZE_INT; i ++)
     //     log_info("%d", input_chunk_ptrs[3][i]);
 
+    if(offload_flag){
+        if(init_worker(ucp_context, &server_worker) != 0){
+            log_error("init_worker failed!\n");
+            return -1;
+        }
+
+        if(init_listener(server_worker, &server_listener, NULL, server_port[world_rank])!= 0){
+            log_error("init_listener failed!\n");
+            return -1;
+        }
+
+        if(register_am_recv_callback(server_worker) != UCS_OK){
+            log_error("register_am_recv_callback failed!\n");
+            return -1;
+        }
+    }
+
     start_thread();
-    // if(input_buffer == NULL){
-    //     log_error("input_buffer is NULL");
-    //     return -1;
-    // }
+    log_debug("start thread success!\n");
+    while (1)
+    {
+        ucp_worker_progress(server_worker);
+        if(recv_buffer_ptr_queue.size() != 0){
+            int *tempbuffer;
+            {
+                std::lock_guard<std::mutex> lock(queue_mutex);
+                tempbuffer = recv_buffer_ptr_queue.front();
+                recv_buffer_ptr_queue.pop();
+            }
+            memcpy(input_buffer, tempbuffer, BUFFER_SIZE_INT * sizeof(int));
+            //通知工作线程可以开始allreduce了
+            for(int i = 0; i < xmlparser.ranks[world_rank]->tbs.size(); i++){
+                sem_post(&sem_4_th_wait);
+            }
+
+            //等待一次allreduce完成
+            for(int i = 0; i < xmlparser.ranks[world_rank]->tbs.size(); i++){
+                sem_wait(&sem_4_main_wait);
+            }
+
+            if(am_send_block(server_worker, server_ep, input_buffer, BUFFER_SIZE_INT * sizeof(int)) != 0){
+                log_error("am_send_block failed!\n");
+            }
+
+            free(tempbuffer);
+        }
+    }
+
+    wait_threads();
     
 
-     log_info("start check");
+
+    log_info("start check");
 
     // if(world_rank == 0)
     //     for(int i = 0; i < BUFFER_SIZE_INT; i ++)

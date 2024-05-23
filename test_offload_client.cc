@@ -20,7 +20,7 @@ int receive_num = 0;
 int request_num = 10;
 
 int flag = 0;
-int BUFFER_INT_SIZE = 64;
+int BUFFER_INT_SIZE = 1024 * 1024 * 16;
 
 
 
@@ -41,7 +41,7 @@ std::vector<std::vector<int>> addMatrices(const std::vector<std::vector<int>>& a
 
 // 执行矩阵加法并测量时间的函数
 
-void performMatrixAddition() {
+std::chrono::duration<double> performMatrixAddition() {
     // 初始化矩阵大小
     int size = 1000; // 1000x1000 矩阵
     std::vector<std::vector<int>> mat1(size, std::vector<int>(size, 1));
@@ -58,6 +58,7 @@ void performMatrixAddition() {
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed = end - start;
     log_info("Time taken to add two 1000x1000 matrices: %f seconds", elapsed.count());
+    return elapsed;
 }
 
 
@@ -73,6 +74,8 @@ int main(int argc, char **argv){
     ucp_context_h context;
     ucp_listener_h listener;
 
+    std::chrono::duration<double> pure_net_time;
+    std::chrono::duration<double> total_time;
     
 
     for(int i = 0; i < request_num; i++){
@@ -82,11 +85,6 @@ int main(int argc, char **argv){
         }
     }
 
-    // tempbuffer = (int*)malloc(64 * sizeof(int));
-
-    // for(int i = 0; i < 64; i++){
-    //     tempbuffer[i] = i;
-    // }
 
     //初始化 context
     if(init_context(&context) != 0){
@@ -138,6 +136,29 @@ int main(int argc, char **argv){
     client_register_am_recv_callback(g_worker);
 
 ////////////////////////////////////////////////////////////////////////////////////////
+
+    
+    //compute pure net time
+    {
+        auto start = std::chrono::high_resolution_clock::now();
+
+        for(int i = 0; i < request_num; i ++){
+            if(am_send_block(g_worker, g_ep, buffer_ptrs[i], BUFFER_INT_SIZE * sizeof(int)) != 0){
+                log_error("Failed to send active message");
+                return -1;
+            }          
+        }
+
+        while(receive_num < request_num){
+                ucp_worker_progress(g_worker);
+        }
+        receive_num = 0;
+        auto end = std::chrono::high_resolution_clock::now();
+        pure_net_time = end - start;
+        log_info("Total time taken to : %f seconds", pure_net_time.count());
+    }
+
+
     auto start = std::chrono::high_resolution_clock::now();
 
     for(int i = 0; i < request_num; i ++){
@@ -149,12 +170,20 @@ int main(int argc, char **argv){
 
     
     //do_somecompute
-    performMatrixAddition();
+    std::chrono::duration<double> compute_time = performMatrixAddition();
 
     //wait allreduce
     while(receive_num < request_num){
         ucp_worker_progress(g_worker);
     }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    total_time = end - start;
+    log_info("Total time taken to : %f seconds", total_time.count());
+
+    log_info("pure net time: %f, compute time: %f, total time: %f", pure_net_time.count(), compute_time.count(), total_time.count());
+
+    log_info("overlapping ratio: %f", (pure_net_time.count() + compute_time.count() - total_time.count()) / total_time.count());
 
     return 0;
 }

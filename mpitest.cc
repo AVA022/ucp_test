@@ -46,6 +46,9 @@ int world_size, world_rank;
 XMLParser xmlparser;
 
 std::unordered_map<std::string, sem_t*> sem_hash;
+std::unordered_map<pthread_t, int> send_num_hash;
+
+//int send_num = 0;
 
 // static bool init_chunk_ptrs(int chunk_num, enum buffer_type type)
 // {
@@ -161,6 +164,7 @@ static bool check_result_vector_buffer(int rank_size)
     for (int i = 0; i < BUFFER_SIZE_INT; i++) {
         //printf("input_buffer[%d] = %d\n", i, input_buffer[i]);
         if (input_buffer[i] != rank_size * i) {
+            log_error("error result: %d should be : %d", input_buffer[i], rank_size * i);
             return false;
         }
     }
@@ -318,6 +322,9 @@ static int receive_block(ucp_worker_h ucp_worker, ucp_tag_t tag,ucp_tag_t tag_ma
     ucs_status_t status;
     ucp_request_param_t recv_param;
 
+    ucp_worker_fence(ucp_worker);
+    //status = ucp_worker_flush(ucp_worker);
+
     for (;;) {
         /* Probing incoming events in non-block mode */
         msg_tag = ucp_tag_probe_nb(ucp_worker, tag, tag_mask, 1, &info_tag);
@@ -329,6 +336,11 @@ static int receive_block(ucp_worker_h ucp_worker, ucp_tag_t tag,ucp_tag_t tag_ma
         ucp_worker_progress(ucp_worker);
     }
 
+    // status = ucp_worker_flush(ucp_worker);
+    // if (status != UCS_OK) {
+    //     log_error("Failed to flush worker: %s\n", ucs_status_string(status));
+    // }
+
     recv_param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
                               UCP_OP_ATTR_FIELD_DATATYPE ;
     recv_param.datatype     = ucp_dt_make_contig(1);
@@ -336,6 +348,8 @@ static int receive_block(ucp_worker_h ucp_worker, ucp_tag_t tag,ucp_tag_t tag_ma
 
     request = ucp_tag_msg_recv_nbx(ucp_worker, buffer, info_tag.length, msg_tag,
                                    &recv_param);
+
+    
     status  = ucx_wait(ucp_worker, request, "receive", data_msg_str);
 
     if(status != UCS_OK)
@@ -350,13 +364,16 @@ static int receive_block(ucp_worker_h ucp_worker, ucp_tag_t tag,ucp_tag_t tag_ma
 static void send_handler(void *request, ucs_status_t status, void *ctx)
 {
     //struct ucx_context *context = (struct ucx_context *)request;
-    const char *str             = (const char *)ctx;
+    free(ctx);
 
     //context->completed = 1;
 
     printf("[0x%x] send handler called for \"%s\" with status %d (%s)\n",
-           (unsigned int)pthread_self(), str, status,
+           (unsigned int)pthread_self(), "UCX tag message", status,
            ucs_status_string(status));
+
+    send_num_hash[pthread_self()] --;
+    //("send_num: %d", send_num);
 }
 
 
@@ -366,14 +383,22 @@ static int send_block(ucp_worker_h ucp_worker, ucp_ep_h ep, void * buffer, ucp_t
     ucs_status_t status;
     ucp_request_param_t send_param;
 
+    void *temp_buffer = (void *)malloc(length);
+    memcpy(temp_buffer, buffer, length);
+
     send_param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
-                              UCP_OP_ATTR_FIELD_USER_DATA;
+                              UCP_OP_ATTR_FIELD_USER_DATA|
+                              UCP_OP_ATTR_FLAG_NO_IMM_CMPL;
     send_param.cb.send      = send_handler;
-    send_param.user_data    = (void*)data_msg_str;
-    request                 = ucp_tag_send_nbx(ep, buffer, length, tag,
+    send_param.user_data    = (void*)temp_buffer;
+    request                 = ucp_tag_send_nbx(ep, temp_buffer, length, tag,
                                                &send_param);
-    status                  = ucx_wait(ucp_worker, request, "send",
-                                       data_msg_str);
+    // status                  = ucx_wait(ucp_worker, request, "send",
+    //                                    data_msg_str);
+
+    send_num_hash[pthread_self()] ++;
+
+    status = UCS_OK;
     if (status != UCS_OK) {
         return -1;
     }else{
@@ -558,7 +583,7 @@ static void allgather_addresses(ucp_worker_h *workers, int num_workers_per_proce
     // Assuming UCP workers have been initialized
     for (int i = 0; i < num_workers_per_process; i++) {
         ucp_worker_get_address(workers[i], &local_addrs[i], &local_addr_lengths[i]);
-        log_info("loop %d", i);
+        //log_info("loop %d", i);
     }
     //log_debug("1");
     //printf("1\n");
@@ -644,11 +669,11 @@ static int init_all_workers_ucp(ucp_worker_h *workers, ucp_context_h ucp_context
 }
 
 
-int connect_to_peer(int self_rank, int peer_rank, ucp_worker_h ucp_worker, ucp_ep_h *ep)
+int connect_to_peer(int self_rank, int peer_rank, ucp_worker_h ucp_worker, ucp_ep_h *ep, int channel)
 {
     int peer_tb = -1;
     for(const auto& tb: xmlparser.ranks[peer_rank]->tbs){
-        if(tb->recv == self_rank){
+        if(tb->recv == self_rank && tb->chan == channel){
             peer_tb = tb->id;
             break;
         }   
@@ -790,8 +815,10 @@ void* interpreter(void* arg){
     ucp_ep_h ep;
     ucp_worker_h worker = g_workers[tb_id];
     if(tb->send != -1){
-        connect_to_peer(world_rank, tb->send, worker, &ep);
+        connect_to_peer(world_rank, tb->send, worker, &ep, tb->chan);
     }
+
+    send_num_hash[pthread_self()] = 0;
 
     auto start = std::chrono::high_resolution_clock::now();
     for(const auto& step: tb->steps){
@@ -868,6 +895,12 @@ void* interpreter(void* arg){
         }
     }
 
+    log_info("wait for all send to complete");
+    
+    while(send_num_hash[pthread_self()] != 0){
+        ucp_worker_progress(worker);
+    }
+
     auto end = std::chrono::high_resolution_clock::now();  // 结束时间
     std::chrono::duration<double, std::milli> temp = end - start;  // 计算耗时
     elapsed = (elapsed.count() < temp.count()) ? temp : elapsed;  // 计算耗时
@@ -914,8 +947,18 @@ int init_buffer_pool(int buffer_size_int){
     return 0;
 }
 
+int check_buffer_pool(int buffer_size_int){
+    for(int i = 0; i < buffer_size_int; i ++){
+        if(input_buffer[i] != i){
+            log_error("input_buffer[%d]: %d should be %d", i, input_buffer[i], i);
+            return -1;
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
-    xmlparser.parseXMLAndFillStructs("allreduce_binomial_tree_one.xml");
+    xmlparser.parseXMLAndFillStructs("allreduce_1step_8nodes.xml");
     //xmlparser.displayRanks();
     //log_info("%d", xmlparser.ranks[0]->tbs[0]->steps[0]->hasdep);
     //alocate g_workers
@@ -958,9 +1001,11 @@ int main(int argc, char **argv) {
 
     MPI_Finalize();
 
-    init_buffer_pool(1024 * 1024);
+    init_buffer_pool(1024 * 1024 * 8);
     // for(int i = 0; i < CHUNK_SIZE_INT; i ++)
     //     log_info("%d", input_chunk_ptrs[3][i]);
+
+    //check_buffer_pool(1024 * 1024 * 8);
 
     start_thread();
     // if(input_buffer == NULL){

@@ -13,11 +13,16 @@
 
 #include <sockaddr_util.h>
 
+#include <vector>
+
 extern ucp_worker_h g_worker;
 extern ucp_ep_h g_ep;
 extern const char *am_msg_str; // "active message"
 
-extern int *tempbuffer;
+extern std::vector<int*> buffer_ptrs;
+extern int flag;
+extern int receive_num;
+extern int BUFFER_INT_SIZE;
 
 static void failure_handler(void *arg, ucp_ep_h ep, ucs_status_t status)
 {
@@ -149,13 +154,13 @@ int init_worker(ucp_context_h ucp_context, ucp_worker_h *ucp_worker_p){
     return 0;
 }
 
-int init_endpoint_ip(ucp_worker_h ucp_worker, const char *address_str, ucp_ep_h *ep)
+int init_endpoint_ip(ucp_worker_h ucp_worker, const char *address_str, int16_t port,ucp_ep_h *ep)
 {
     ucp_ep_params_t ep_params;
     ucs_status_t status;
     struct sockaddr_storage connect_addr;
 
-    set_sock_addr(address_str, &connect_addr, 13337);
+    set_sock_addr(address_str, &connect_addr, port);
 
     ep_params.field_mask       = UCP_EP_PARAM_FIELD_FLAGS       |
                                  UCP_EP_PARAM_FIELD_SOCK_ADDR   |
@@ -323,6 +328,8 @@ ucs_status_t ucp_am_data_cb(void *arg, const void *header, size_t header_length,
     size_t idx;
     size_t offset;
 
+    int *tempbuffer = (int*)malloc(length);
+
     if (header_length != 0) {
         fprintf(stderr, "received unexpected header, length %ld", header_length);
     }
@@ -350,18 +357,6 @@ ucs_status_t ucp_am_data_cb(void *arg, const void *header, size_t header_length,
         return UCS_OK;
     }
 
-    /* Message delivered with eager protocol, data should be available
-     * immediately
-     */
-    // am_data_desc.is_rndv = 0;
-
-    // iov = am_data_desc.recv_buf;
-    // offset = 0;
-    // for (idx = 0; idx < iov_cnt; idx++) {
-    //     mem_type_memcpy(iov[idx].buffer, UCS_PTR_BYTE_OFFSET(data, offset),
-    //                     iov[idx].length);
-    //     offset += iov[idx].length;
-    // }
     memcpy(tempbuffer, data, length);
     return UCS_OK;
 }
@@ -380,6 +375,71 @@ ucs_status_t register_am_recv_callback(ucp_worker_h worker)
     return ucp_worker_set_am_recv_handler(worker, &param);
 }
 
+ucs_status_t client_ucp_am_recv_handler(void *arg, const void *header, size_t header_length,
+                            void *data, size_t length,
+                            const ucp_am_recv_param_t *param)
+{
+    ucp_dt_iov_t *iov;
+    size_t idx;
+    size_t offset;
 
+    if (header_length != 0) {
+        fprintf(stderr, "received unexpected header, length %ld", header_length);
+    }
+
+    if(length != BUFFER_INT_SIZE * sizeof(int)){
+        log_error("received unexpected data length: %ld, expected : %ld", length, BUFFER_INT_SIZE * sizeof(int));
+    }
+
+    int *tempbuffer = buffer_ptrs[receive_num];
+
+    if (param->recv_attr & UCP_AM_RECV_ATTR_FLAG_RNDV) {
+        /* Rendezvous request arrived, data contains an internal UCX descriptor,
+         * which has to be passed to ucp_am_recv_data_nbx function to confirm
+         * data transfer.
+         */
+        // am_data_desc.is_rndv = 1;
+        // am_data_desc.desc    = data;
+        ucp_request_param_t params;
+        ucs_status_ptr_t    request;
+        params.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
+                          UCP_OP_ATTR_FIELD_USER_DATA;
+        params.cb.recv_am    = am_recv_cb;
+        request              = ucp_am_recv_data_nbx(g_worker,
+                                                    data,
+                                                    tempbuffer, 
+                                                    length,
+                                                    &params);
+        
+        ucs_status_t status = ucx_wait(g_worker, request, "recv",
+                                       am_msg_str);
+        receive_num ++;
+        log_info("recive active message success, receive_num: %d\n", receive_num);
+
+        return UCS_OK;
+    }
+
+    memcpy(tempbuffer, data, length);
+    
+    receive_num ++;
+
+    log_info("recive active message success, receive_num: %d\n", receive_num);
+
+    return UCS_OK;
+}
+
+ucs_status_t client_register_am_recv_callback(ucp_worker_h worker)
+{
+    ucp_am_handler_param_t param;
+
+    param.field_mask = UCP_AM_HANDLER_PARAM_FIELD_ID |
+                       UCP_AM_HANDLER_PARAM_FIELD_CB |
+                       UCP_AM_HANDLER_PARAM_FIELD_ARG;
+    param.id         = 0;
+    param.cb         = client_ucp_am_recv_handler;
+    param.arg        = worker; /* not used in our callback */
+
+    return ucp_worker_set_am_recv_handler(worker, &param);
+}
 
 #endif // UCP_INIT_RESOURCE_H

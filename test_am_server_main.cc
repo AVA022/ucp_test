@@ -14,7 +14,7 @@ ucp_ep_h g_ep;
 
 const char *am_msg_str = "active message";
 int *tempbuffer;
-
+std::vector<int*> buffer_ptrs;
 
 int main(){
     ucp_context_h context;
@@ -37,7 +37,8 @@ int main(){
     }
 
     if(init_listener(g_worker, &listener, NULL) != 0){
-
+        log_error("Failed to initialize listener");
+        return -1;
     }
 
     register_am_recv_callback(g_worker);
