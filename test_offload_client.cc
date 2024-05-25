@@ -20,7 +20,7 @@ int receive_num = 0;
 int request_num = 10;
 
 int flag = 0;
-int BUFFER_INT_SIZE = 1024 * 1024 * 16;
+int BUFFER_INT_SIZE = 1024 * 1024 * 32;
 
 
 
@@ -62,11 +62,13 @@ std::chrono::duration<double> performMatrixAddition() {
 }
 
 
-void wait_allreduce(){
+void *wait_allreduce(void *arg){
     while(receive_num < request_num){
         ucp_worker_progress(g_worker);
     }
+    return NULL;
 }
+
 
 
 
@@ -78,11 +80,17 @@ int main(int argc, char **argv){
     std::chrono::duration<double> total_time;
     
 
-    for(int i = 0; i < request_num; i++){
-        buffer_ptrs.push_back((int*)malloc(BUFFER_INT_SIZE * sizeof(int)));
-        for(int j = 0; j < BUFFER_INT_SIZE; j++){
-            buffer_ptrs[i][j] = i * BUFFER_INT_SIZE + j;
-        }
+    // for(int i = 0; i < request_num; i++){
+    //     buffer_ptrs.push_back((int*)malloc(BUFFER_INT_SIZE * sizeof(int)));
+    //     for(int j = 0; j < BUFFER_INT_SIZE; j++){
+    //         buffer_ptrs[i][j] = i * BUFFER_INT_SIZE + j;
+    //     }
+    // }
+
+  
+    buffer_ptrs.push_back((int*)malloc(BUFFER_INT_SIZE * sizeof(int)));
+    for(int i = 0; i < BUFFER_INT_SIZE; i++){
+        buffer_ptrs[0][i] = i;
     }
 
 
@@ -143,7 +151,7 @@ int main(int argc, char **argv){
         auto start = std::chrono::high_resolution_clock::now();
 
         for(int i = 0; i < request_num; i ++){
-            if(am_send_block(g_worker, g_ep, buffer_ptrs[i], BUFFER_INT_SIZE * sizeof(int)) != 0){
+            if(am_send_block(g_worker, g_ep, buffer_ptrs[0], BUFFER_INT_SIZE * sizeof(int)) != 0){
                 log_error("Failed to send active message");
                 return -1;
             }          
@@ -162,20 +170,22 @@ int main(int argc, char **argv){
     auto start = std::chrono::high_resolution_clock::now();
 
     for(int i = 0; i < request_num; i ++){
-        if(am_send_block(g_worker, g_ep, buffer_ptrs[i], BUFFER_INT_SIZE * sizeof(int)) != 0){
+        if(am_send_block(g_worker, g_ep, buffer_ptrs[0], BUFFER_INT_SIZE * sizeof(int)) != 0){
             log_error("Failed to send active message");
             return -1;
         }
     }
 
+    pthread_t thread;
+    pthread_create(&thread, NULL, wait_allreduce, NULL);
     
     //do_somecompute
     std::chrono::duration<double> compute_time = performMatrixAddition();
 
-    //wait allreduce
-    while(receive_num < request_num){
-        ucp_worker_progress(g_worker);
-    }
+
+    // Wait for the thread to finish
+    pthread_join(thread, NULL);
+    
 
     auto end = std::chrono::high_resolution_clock::now();
     total_time = end - start;

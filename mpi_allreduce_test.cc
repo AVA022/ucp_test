@@ -20,20 +20,23 @@ int main(int argc, char** argv) {
     warmup(MPI_COMM_WORLD, 1048576);
 
     //主测试循环
-    for (int n = 256; n <= 1048576; n *= 2) {
+    for (int n = 1048576; n <= 1048576; n *= 2) {
         std::vector<int> sendbuf(n, rank);  // 使用 int 类型
         std::vector<int> recvbuf(n, 0);     // 使用 int 类型
 
-        double start = MPI_Wtime();
-        MPI_Allreduce(sendbuf.data(), recvbuf.data(), n, MPI_INT, MPI_SUM, MPI_COMM_WORLD);  // 使用 MPI_INT
-        double end = MPI_Wtime();
-
+        double duration = 0;
+        for(int i = 0; i < 1000; i++){
+            double start = MPI_Wtime();
+            MPI_Allreduce(sendbuf.data(), recvbuf.data(), n, MPI_INT, MPI_SUM, MPI_COMM_WORLD);  // 使用 MPI_INT
+            double end = MPI_Wtime();
+            duration += end - start;
+        }
         if (rank == 0) {
-            double duration = end - start;
+            duration = duration / 1000;
             double dataSizeBytes = n * sizeof(int);  // 计算 int 类型的字节大小
             double transferRate = dataSizeBytes / duration / 1e6; // MB/s
-            std::cout << "Data size: " << dataSizeBytes << " bytes, Time: " << duration
-                      << " seconds, Transfer rate: " << transferRate << " MB/s" << std::endl;
+            std::cout << "Data size: " << dataSizeBytes << " bytes, Time: " << duration * 1000
+                      << " ms, Transfer rate: " << transferRate << " MB/s" << std::endl;
         }
     }
     

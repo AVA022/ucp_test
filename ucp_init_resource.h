@@ -391,7 +391,7 @@ ucs_status_t client_ucp_am_recv_handler(void *arg, const void *header, size_t he
         log_error("received unexpected data length: %ld, expected : %ld", length, BUFFER_INT_SIZE * sizeof(int));
     }
 
-    int *tempbuffer = buffer_ptrs[receive_num];
+    int *tempbuffer = buffer_ptrs[0];
 
     if (param->recv_attr & UCP_AM_RECV_ATTR_FLAG_RNDV) {
         /* Rendezvous request arrived, data contains an internal UCX descriptor,
