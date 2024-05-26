@@ -22,7 +22,7 @@ mpirun -np 8 ./test_offload -i allreduce_ring_8nodes.xml -s 1024
 ./test_offload_client 127.0.0.1 13337
 ./test_offload_client 127.0.0.1 23337
 
-
+export UCX_LOG_LEVEL=error
 
 MCA coll tuned: parameter "coll_tuned_allreduce_algorithm" (current
                           value: "ignore", data source: default, level: 5

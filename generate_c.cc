@@ -17,6 +17,10 @@
 #include <queue>
 #include <mutex>
 
+#define MAX_RANK_ID 50
+
+typedef void (*func_ptr_t)();
+
 static ucs_status_t ep_status = UCS_OK;
 static const char *data_msg_str = "UCX data message";
 static const ucp_tag_t tag = 0x1337a880u;
@@ -28,6 +32,8 @@ int *output_buffer;
 int **output_chunk_buffer;
 int *scratch_buffer;
 int **scratch_chunk_buffer;
+
+func_ptr_t func_ptr[MAX_RANK_ID];
 
 const char *am_msg_str = "active message";
 
@@ -309,6 +315,7 @@ static int receive_block(ucp_worker_h ucp_worker, ucp_tag_t tag, ucp_tag_t tag_m
     ucs_status_t status;
     ucp_request_param_t recv_param;
 
+    // log_debug("start probe\n");
     for (;;)
     {
         /* Probing incoming events in non-block mode */
@@ -321,6 +328,7 @@ static int receive_block(ucp_worker_h ucp_worker, ucp_tag_t tag, ucp_tag_t tag_m
 
         ucp_worker_progress(ucp_worker);
     }
+    // log_debug("probe success\n");
 
     recv_param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
                               UCP_OP_ATTR_FIELD_DATATYPE;
@@ -667,7 +675,7 @@ static int init_all_workers_ucp(ucp_worker_h *workers, ucp_context_h ucp_context
     return 0;
 }
 
-int connect_to_peer(int self_rank, int peer_rank, ucp_worker_h ucp_worker, ucp_ep_h *ep, int channel, int peer_tb)
+int connect_to_peer(int self_rank, int peer_rank, ucp_worker_h ucp_worker, ucp_ep_h *ep, int peer_tb)
 {
     // for(const auto& tb: xmlparser.ranks[peer_rank]->tbs){
     //     if(tb->recv == self_rank && tb->chan == channel){
@@ -894,12 +902,69 @@ ucs_status_t register_am_recv_callback(ucp_worker_h worker)
     return ucp_worker_set_am_recv_handler(worker, &param);
 }
 
+int init_buffer_pool_generate(int buffer_size_int, int base_chunk_num, int i_chunks, int o_chunks, int s_chunks)
+{
+    BUFFER_SIZE_INT = buffer_size_int;
+    CHUNK_SIZE_INT = buffer_size_int / base_chunk_num;
+
+    if (i_chunks != 0)
+    {
+        if (init_buffer_chunk(i_chunks, INPUT) != 0)
+        {
+            log_error("init_buffer_chunk failed!\n");
+            return -1;
+        }
+    }
+
+    if (o_chunks != 0)
+    {
+        init_buffer_chunk(o_chunks, OUTPUT);
+    }
+
+    if (s_chunks != 0)
+    {
+        init_buffer_chunk(s_chunks, SCRATCH);
+    }
+
+    return 0;
+}
+
+int check_buffer_pool(int buffer_size_int)
+{
+    for (int i = 0; i < buffer_size_int; i++)
+    {
+        if (input_buffer[i] != i)
+        {
+            log_error("input_buffer[%d]: %d should be %d", i, input_buffer[i], i);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+void init_sem_hash(int world_rank)
+{
+    for (int i = 0; i < 32; i++)
+    {
+        for (int j = 0; j < 50; j++)
+        {
+            sem_t *sem = (sem_t *)malloc(sizeof(sem_t));
+            sem_init(sem, 0, 0);
+            std::string hash_key = std::to_string(i) + "/" + std::to_string(j);
+            // if(world_rank == 0)
+            //     log_debug("init_sem_hash: %s\n", hash_key.c_str());
+            sem_hash[hash_key] = sem;
+        }
+    }
+}
+
 void *rank_0_tb_0(void *arg)
 {
     std::string hash_key;
     ucp_ep_h ep;
     int tb_id = 0;
     ucp_worker_h worker = g_workers[tb_id];
+    send_num_hash[pthread_self()] = 0;
 
     log_trace("rankid:%d tbid:%d start recieve_reduce_copy / send srcoff: %d / dstoff: %d", world_rank, 0, 1, 1);
     if (recieve_reduce_copy(worker, ep, buffer_type::INPUT, 1, buffer_type::INPUT, 1, 1) != 0)
@@ -916,7 +981,10 @@ void *rank_0_tb_0(void *arg)
 
     hash_key = std::to_string(1) + "/" + std::to_string(0);
     log_info("rankid:%d tbid:%d wait for %s\n", world_rank, 0, hash_key.c_str());
-    sem_wait(sem_hash[hash_key]);
+    while (sem_trywait(sem_hash[hash_key]) != 0)
+    {
+        ucp_worker_progress(worker);
+    }
 
     log_trace("rankid:%d tbid:%d start recv / send srcoff: %d / dstoff: %d", world_rank, 0, 0, 0);
     if (chunk_recieve(worker, buffer_type::INPUT, 0, 1) != 0)
@@ -933,7 +1001,8 @@ void *rank_0_tb_1(void *arg)
     ucp_ep_h ep;
     int tb_id = 1;
     ucp_worker_h worker = g_workers[tb_id];
-
+    send_num_hash[pthread_self()] = 0;
+    connect_to_peer(0, 1, worker, &ep, 0);
     log_trace("rankid:%d tbid:%d start /  send srcoff: %d / dstoff: %d", world_rank, 1, 0, 0);
     if (chunk_send(worker, ep, buffer_type::INPUT, 0, buffer_type::INPUT, 0, 1) != 0)
     {
@@ -949,7 +1018,10 @@ void *rank_0_tb_1(void *arg)
 
     hash_key = std::to_string(0) + "/" + std::to_string(0);
     log_info("rankid:%d tbid:%d wait for %s\n", world_rank, 1, hash_key.c_str());
-    sem_wait(sem_hash[hash_key]);
+    while (sem_trywait(sem_hash[hash_key]) != 0)
+    {
+        ucp_worker_progress(worker);
+    }
 
     log_trace("rankid:%d tbid:%d start /  send srcoff: %d / dstoff: %d", world_rank, 1, 1, 1);
     if (chunk_send(worker, ep, buffer_type::INPUT, 1, buffer_type::INPUT, 1, 1) != 0)
@@ -965,7 +1037,7 @@ void rank_0_start_threads()
 
     pthread_create(&threads[0], NULL, rank_0_tb_0, NULL);
 
-    pthread_create(&threads[0], NULL, rank_0_tb_1, NULL);
+    pthread_create(&threads[1], NULL, rank_0_tb_1, NULL);
 
     for (int i = 0; i < 2; i++)
     {
@@ -979,6 +1051,7 @@ void *rank_1_tb_0(void *arg)
     ucp_ep_h ep;
     int tb_id = 0;
     ucp_worker_h worker = g_workers[tb_id];
+    send_num_hash[pthread_self()] = 0;
 
     log_trace("rankid:%d tbid:%d start recieve_reduce_copy / send srcoff: %d / dstoff: %d", world_rank, 0, 0, 0);
     if (recieve_reduce_copy(worker, ep, buffer_type::INPUT, 0, buffer_type::INPUT, 0, 1) != 0)
@@ -995,7 +1068,10 @@ void *rank_1_tb_0(void *arg)
 
     hash_key = std::to_string(1) + "/" + std::to_string(0);
     log_info("rankid:%d tbid:%d wait for %s\n", world_rank, 0, hash_key.c_str());
-    sem_wait(sem_hash[hash_key]);
+    while (sem_trywait(sem_hash[hash_key]) != 0)
+    {
+        ucp_worker_progress(worker);
+    }
 
     log_trace("rankid:%d tbid:%d start recv / send srcoff: %d / dstoff: %d", world_rank, 0, 1, 1);
     if (chunk_recieve(worker, buffer_type::INPUT, 1, 1) != 0)
@@ -1012,7 +1088,8 @@ void *rank_1_tb_1(void *arg)
     ucp_ep_h ep;
     int tb_id = 1;
     ucp_worker_h worker = g_workers[tb_id];
-
+    send_num_hash[pthread_self()] = 0;
+    connect_to_peer(1, 0, worker, &ep, 0);
     log_trace("rankid:%d tbid:%d start /  send srcoff: %d / dstoff: %d", world_rank, 1, 1, 1);
     if (chunk_send(worker, ep, buffer_type::INPUT, 1, buffer_type::INPUT, 1, 1) != 0)
     {
@@ -1028,7 +1105,10 @@ void *rank_1_tb_1(void *arg)
 
     hash_key = std::to_string(0) + "/" + std::to_string(0);
     log_info("rankid:%d tbid:%d wait for %s\n", world_rank, 1, hash_key.c_str());
-    sem_wait(sem_hash[hash_key]);
+    while (sem_trywait(sem_hash[hash_key]) != 0)
+    {
+        ucp_worker_progress(worker);
+    }
 
     log_trace("rankid:%d tbid:%d start /  send srcoff: %d / dstoff: %d", world_rank, 1, 0, 0);
     if (chunk_send(worker, ep, buffer_type::INPUT, 0, buffer_type::INPUT, 0, 1) != 0)
@@ -1044,10 +1124,73 @@ void rank_1_start_threads()
 
     pthread_create(&threads[0], NULL, rank_1_tb_0, NULL);
 
-    pthread_create(&threads[0], NULL, rank_1_tb_1, NULL);
+    pthread_create(&threads[1], NULL, rank_1_tb_1, NULL);
 
     for (int i = 0; i < 2; i++)
     {
         pthread_join(threads[i], NULL);
     }
+}
+
+int main(int argc, char **argv)
+{
+    int buffer_size_int = 1024;
+    int th_nums[] = {2, 2};
+    int tb_num = th_nums[world_rank];
+    g_workers = (ucp_worker_h *)malloc(tb_num * sizeof(ucp_worker_h));
+    log_debug("tb_num: %d", tb_num);
+    // log_info("%d", xmlparser.nchunksperloop);
+
+    MPI_Init(&argc, &argv);
+
+    // printf("Hello, world!\n");
+
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+
+    init_sem_hash(world_rank);
+
+    // 初始化UCP
+    ucp_context_h ucp_context;
+
+    if (init_context(&ucp_context) != 0)
+    {
+        log_error("init_context failed!\n");
+        return -1;
+    }
+
+    // init_worker
+    if (init_all_workers_ucp(g_workers, ucp_context, tb_num) != 0)
+    {
+        log_error("init_all_workers_ucp failed!\n");
+        return -1;
+    }
+
+    log_debug("begin to allgather addresses\n");
+    allgather_addresses(g_workers, tb_num, world_size, world_rank);
+    log_debug("finish allgather addresses\n");
+
+    MPI_Finalize();
+
+    init_buffer_pool_generate(buffer_size_int, 2, 2, 0, 0);
+    func_ptr[0] = rank_0_start_threads;
+    func_ptr[1] = rank_1_start_threads;
+    func_ptr[world_rank]();
+
+    log_info("start check");
+    if (check_result_vector_buffer(world_size))
+    {
+        log_debug("allreduce Test success");
+    }
+    else
+    {
+        log_error("Test failed");
+    }
+
+    free_chunk_ptrs();
+    free_vector_buffer();
+
+    ucp_cleanup(ucp_context);
+
+    return 0;
 }

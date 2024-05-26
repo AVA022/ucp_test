@@ -690,6 +690,8 @@ void init_sem_hash(int world_rank){
     
 }
 
+
+
 void* interpreter(void* arg){
     int tb_id = *(int *)arg;
     const auto& tb = xmlparser.ranks[world_rank]->tbs[tb_id];
@@ -709,7 +711,10 @@ void* interpreter(void* arg){
             if(step->depid != -1){
                 std::string hash_key = std::to_string(step->depid) + "/" + std::to_string(step->deps);
                 log_info("rankid:%d tbid:%d wait for %s\n", world_rank, tb_id, hash_key.c_str());
-                sem_wait(sem_hash[hash_key]);
+                while (sem_trywait(sem_hash[hash_key]) != 0)
+                {
+                    ucp_worker_progress(worker);
+                }
             }
 
             switch (step->type)
@@ -972,7 +977,7 @@ int main(int argc, char **argv) {
     if(num_loop == 1){
         log_info("start check");
         if(check_result_vector_buffer(world_size)){
-            log_debug("allreduce Test success");
+            log_info("allreduce Test success");
         }
         else{
             log_error("Test failed");
